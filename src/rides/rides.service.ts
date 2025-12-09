@@ -144,18 +144,20 @@ export class RidesService {
           pickup_lng: pickup.lng,
           dropoff_lat: dropoff.lat,
           dropoff_lng: dropoff.lng,
-          fare_estimate: calculatedFare, // ✅ Using the secure calculated value
+          fare_estimate: calculatedFare,
           status: 'PENDING',
           nearby_h3_indices: nearbyIndices,
+
+          // ✅ Initialize Batch Logic
+          dispatch_batch: 1,
+          last_offer_sent_at: new Date().toISOString(),
         })
         .select()
         .single();
 
       if (insertError) throw insertError;
 
-      console.log('Ride created successfully:', rideData.id);
-
-      // 5. Trigger the Matcher
+      // 5. Trigger the Matcher (This sends Batch 1 immediately)
       await this.supabase.rpc('find_and_offer_ride', {
         target_ride_id: rideData.id,
       });
@@ -264,6 +266,51 @@ export class RidesService {
       }
     } catch (err) {
       this.logger.error('Cron job failed:', err);
+    }
+  }
+
+  @Cron('*/10 * * * * *') // Every 10 seconds
+  async handleDispatchWaves() {
+    // 1. Find rides that are stuck in PENDING and need a new batch
+    // Condition: Status is PENDING AND last offer was sent > 15 seconds ago
+    const fifteenSecondsAgo = new Date(Date.now() - 15 * 1000).toISOString();
+
+    const { data: stuckRides, error } = await this.supabase
+      .from('rides')
+      .select('id, dispatch_batch')
+      .eq('status', 'PENDING')
+      .lt('last_offer_sent_at', fifteenSecondsAgo);
+
+    if (error) {
+      this.logger.error('Error fetching stuck rides:', error);
+      return;
+    }
+
+    if (!stuckRides || stuckRides.length === 0) return;
+
+    this.logger.log(`🌊 Processing waves for ${stuckRides.length} rides...`);
+
+    for (const ride of stuckRides) {
+      // Cap the batch level at 3 so we don't increment forever
+      const nextBatch = ride.dispatch_batch >= 3 ? 3 : ride.dispatch_batch + 1;
+
+      // A. Update the batch level in DB
+      await this.supabase
+        .from('rides')
+        .update({
+          dispatch_batch: nextBatch,
+          // We update 'last_offer_sent_at' inside the SQL function,
+          // but updating it here ensures the Cron doesn't pick it up again immediately if the SQL fails.
+          last_offer_sent_at: new Date().toISOString(),
+        })
+        .eq('id', ride.id);
+
+      // B. Trigger the SQL function to find new drivers for this batch
+      await this.supabase.rpc('find_and_offer_ride', {
+        target_ride_id: ride.id,
+      });
+
+      this.logger.log(`Ride ${ride.id} promoted to Batch ${nextBatch}`);
     }
   }
 }
