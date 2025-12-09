@@ -3,13 +3,17 @@ import {
   BadRequestException,
   InternalServerErrorException,
   ServiceUnavailableException,
+  Logger,
 } from '@nestjs/common';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { latLngToCell, gridDisk } from 'h3-js';
 
+import { Cron, CronExpression } from '@nestjs/schedule';
+
 @Injectable()
 export class RidesService {
   private supabase: SupabaseClient;
+  private readonly logger = new Logger(RidesService.name);
 
   constructor() {
     this.supabase = createClient(
@@ -203,5 +207,43 @@ export class RidesService {
     throw new InternalServerErrorException(
       'An internal error occurred processing the ride.',
     );
+  }
+
+  @Cron(CronExpression.EVERY_30_SECONDS)
+  async handleStaleRides() {
+    this.logger.log('🕵️ Cron Job: Checking for stuck rides...');
+
+    // Define "Stale" as any ride created more than 2 minutes ago that is still PENDING
+    const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+
+    try {
+      // 1. Cancel the stuck rides in the database
+      const { data, error } = await this.supabase
+        .from('rides')
+        .update({
+          status: 'NO_DRIVERS_AVAILABLE',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('status', 'PENDING')
+        .lt('created_at', twoMinutesAgo)
+        .select();
+
+      if (error) {
+        this.logger.error('Error cancelling stale rides:', error);
+      } else if (data && data.length > 0) {
+        this.logger.warn(`⚠️ Timeout: Cancelled ${data.length} stuck rides.`);
+      }
+
+      // 2. Clean up old offers
+      const { error: rpcError } = await this.supabase.rpc(
+        'cleanup_expired_offers',
+      );
+
+      if (rpcError) {
+        this.logger.error('Error cleaning offers:', rpcError);
+      }
+    } catch (err) {
+      this.logger.error('Cron job failed:', err);
+    }
   }
 }
