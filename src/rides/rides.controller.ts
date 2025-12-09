@@ -7,19 +7,17 @@ export class RidesController {
 
   @Post('request')
   requestRide(@Body() body: any) {
-    // Simple check to ensure body exists before passing to service
     if (!body || !body.pickup || !body.dropoff) {
       throw new BadRequestException('Invalid request body');
     }
 
+    // Update: Removed 'body.fare' from the arguments list
     return this.ridesService.requestRide(
       body.passengerId,
       body.pickup,
       body.dropoff,
-      body.fare,
     );
   }
-
   @Post('accept')
   acceptRide(@Body() body: any) {
     return this.ridesService.acceptRide(body.rideId, body.driverId);

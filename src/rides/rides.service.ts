@@ -96,26 +96,46 @@ export class RidesService {
 
   async requestRide(
     passengerId: string,
-    pickup: { lat: number; lng: number }, // Typed explicitly
-    dropoff: { lat: number; lng: number }, // Typed explicitly
-    fare: number,
+    pickup: { lat: number; lng: number },
+    dropoff: { lat: number; lng: number },
+    // ❌ REMOVED: fare: number (We no longer trust the client's price)
   ) {
     console.log('Processing ride for:', passengerId);
 
     try {
-      // FIX 1: Validate input before H3 calculation
-      if (!pickup || !dropoff)
+      // 1. Validate Input
+      if (!pickup || !dropoff) {
         throw new BadRequestException(
           'Pickup and Dropoff locations are required',
         );
+      }
       this.validateCoordinates(pickup.lat, pickup.lng);
       this.validateCoordinates(dropoff.lat, dropoff.lng);
 
-      // 1. Calculate Search Area (Hexagons)
+      // 2. SECURITY: Calculate Fare on Server
+      // We call your existing SQL function directly from here.
+      const { data: calculatedFare, error: fareError } =
+        await this.supabase.rpc('calculate_fare_estimate', {
+          pickup_lat: pickup.lat,
+          pickup_lng: pickup.lng,
+          dropoff_lat: dropoff.lat,
+          dropoff_lng: dropoff.lng,
+        });
+
+      if (fareError || !calculatedFare) {
+        console.error('Fare Calculation Failed:', fareError);
+        throw new BadRequestException(
+          'Could not calculate fare for this route.',
+        );
+      }
+
+      console.log(`Secure Fare Calculated: ${calculatedFare} DZD`);
+
+      // 3. Calculate Search Area (H3 Hexagons)
       const originIndex = latLngToCell(pickup.lat, pickup.lng, 8);
       const nearbyIndices = gridDisk(originIndex, 1);
 
-      // 2. Insert into Supabase
+      // 4. Insert into Supabase
       const { data: rideData, error: insertError } = await this.supabase
         .from('rides')
         .insert({
@@ -124,7 +144,7 @@ export class RidesService {
           pickup_lng: pickup.lng,
           dropoff_lat: dropoff.lat,
           dropoff_lng: dropoff.lng,
-          fare_estimate: fare,
+          fare_estimate: calculatedFare, // ✅ Using the secure calculated value
           status: 'PENDING',
           nearby_h3_indices: nearbyIndices,
         })
@@ -135,7 +155,7 @@ export class RidesService {
 
       console.log('Ride created successfully:', rideData.id);
 
-      // 3. Trigger the Matcher
+      // 5. Trigger the Matcher
       await this.supabase.rpc('find_and_offer_ride', {
         target_ride_id: rideData.id,
       });
