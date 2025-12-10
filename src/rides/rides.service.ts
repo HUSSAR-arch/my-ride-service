@@ -98,8 +98,9 @@ export class RidesService {
     passengerId: string,
     pickup: { lat: number; lng: number },
     dropoff: { lat: number; lng: number },
-    // ❌ REMOVED: fare: number (We no longer trust the client's price)
-  ) {
+    pickupAddress: string, // <--- ADD ARGUMENT
+    dropoffAddress: string, // <--- ADD ARGUMENT
+  ) { {
     console.log('Processing ride for:', passengerId);
 
     try {
@@ -144,6 +145,9 @@ export class RidesService {
           pickup_lng: pickup.lng,
           dropoff_lat: dropoff.lat,
           dropoff_lng: dropoff.lng,
+
+          pickup_address: pickupAddress,
+          dropoff_address: dropoffAddress,
           fare_estimate: calculatedFare,
           status: 'PENDING',
           nearby_h3_indices: nearbyIndices,
