@@ -100,7 +100,7 @@ export class RidesService {
     dropoff: { lat: number; lng: number },
     pickupAddress: string, // <--- ADD ARGUMENT
     dropoffAddress: string, // <--- ADD ARGUMENT
-  ) { {
+  ) {
     console.log('Processing ride for:', passengerId);
 
     try {
