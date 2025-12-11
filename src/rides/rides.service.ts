@@ -195,6 +195,20 @@ export class RidesService {
           'Ride is no longer available or already accepted.',
         );
       }
+      const { data: passenger } = await this.supabase
+        .from('profiles')
+        .select('push_token')
+        .eq('id', data.passenger_id) // Use data.passenger_id from the updated ride
+        .single();
+
+      if (passenger?.push_token) {
+        // We don't await this so it doesn't block the response
+        this.sendPushNotification(
+          passenger.push_token,
+          'Yalla! Driver Found 🚗',
+          'A driver has accepted your request and is on the way.',
+        );
+      }
 
       console.log('Ride accepted successfully!');
       return { success: true, ride: data };
@@ -202,7 +216,38 @@ export class RidesService {
       this.handleError(err, 'acceptRide');
     }
   }
+  private async sendPushNotification(
+    expoPushToken: string,
+    title: string,
+    body: string,
+  ) {
+    if (!expoPushToken || !expoPushToken.startsWith('ExponentPushToken')) {
+      console.log('Invalid or missing push token');
+      return;
+    }
 
+    const message = {
+      to: expoPushToken,
+      sound: 'default',
+      title: title,
+      body: body,
+      data: { type: 'RIDE_UPDATE' },
+    };
+
+    try {
+      await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Accept-encoding': 'gzip, deflate',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(message),
+      });
+    } catch (error) {
+      console.error('Error sending push notification:', error);
+    }
+  }
   // --- HELPER: Centralized Error Handling ---
   private handleError(err: any, context: string) {
     console.error(`Crash in ${context}:`, err);
