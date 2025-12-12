@@ -101,6 +101,9 @@ export class RidesService {
     pickupAddress: string, // <--- ADD ARGUMENT
     dropoffAddress: string, // <--- ADD ARGUMENT
   ) {
+    console.log('🛑 SERVICE HIT! 🛑');
+    console.log('Pickup Addr:', pickupAddress);
+    console.log('Dropoff Addr:', dropoffAddress);
     console.log('Processing ride for:', passengerId);
 
     try {
@@ -146,8 +149,9 @@ export class RidesService {
           dropoff_lat: dropoff.lat,
           dropoff_lng: dropoff.lng,
 
-          pickup_address: pickupAddress,
-          dropoff_address: dropoffAddress,
+          pickup_address: pickupAddress, // <--- Must match variable name
+          dropoff_address: dropoffAddress, // <--- Must match variable name
+
           fare_estimate: calculatedFare,
           status: 'PENDING',
           nearby_h3_indices: nearbyIndices,
