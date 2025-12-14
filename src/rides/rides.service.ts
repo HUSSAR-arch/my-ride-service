@@ -322,17 +322,75 @@ export class RidesService {
     }
   }
 
+  private async sendDriverPush(driverIds: string[], rideId: string) {
+    if (!driverIds || driverIds.length === 0) return;
+
+    try {
+      // 1. Fetch Push Tokens for these drivers
+      const { data: drivers, error } = await this.supabase
+        .from('profiles')
+        .select('push_token')
+        .in('id', driverIds)
+        .not('push_token', 'is', null);
+
+      if (error) {
+        this.logger.error('Error fetching push tokens for dispatch:', error);
+        return;
+      }
+      if (!drivers || drivers.length === 0) return;
+
+      // 2. Prepare Expo Messages
+      // Filter out empty tokens just in case
+      const validTokens = drivers
+        .map((d) => d.push_token)
+        .filter((t) => t && t.startsWith('ExponentPushToken'));
+
+      if (validTokens.length === 0) return;
+
+      const messages = validTokens.map((token) => ({
+        to: token,
+        sound: 'default',
+        title: 'New Ride Request 🚖',
+        body: 'Tap to accept immediately!',
+        data: { rideId: rideId, type: 'NEW_OFFER' }, // Critical for "tap to open" logic
+        priority: 'high',
+        channelId: 'ride-requests-v4', // Must match the channel ID in your frontend
+      }));
+
+      // 3. Send to Expo (Using simple fetch for valid chunks)
+      // Note: Expo recommends chunking arrays > 100 items.
+      // For this scale, a direct send is usually fine.
+      await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Accept-encoding': 'gzip, deflate',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(messages),
+      });
+
+      this.logger.log(
+        `📲 Sent push notifications to ${validTokens.length} drivers.`,
+      );
+    } catch (err) {
+      this.logger.error('Failed to send driver push notifications:', err);
+    }
+  }
+
   @Cron('*/10 * * * * *') // Every 10 seconds
   async handleDispatchWaves() {
     // 1. Find rides that are stuck in PENDING and need a new batch
-    // Condition: Status is PENDING AND last offer was sent > 15 seconds ago
-    const fifteenSecondsAgo = new Date(Date.now() - 15 * 1000).toISOString();
+
+    // LATENCY BUFFER: We wait 20 seconds (Server) vs 15 seconds (Client)
+    // This gives a 5-second safety window for network delays.
+    const twentySecondsAgo = new Date(Date.now() - 20 * 1000).toISOString();
 
     const { data: stuckRides, error } = await this.supabase
       .from('rides')
       .select('id, dispatch_batch')
       .eq('status', 'PENDING')
-      .lt('last_offer_sent_at', fifteenSecondsAgo);
+      .lt('last_offer_sent_at', twentySecondsAgo);
 
     if (error) {
       this.logger.error('Error fetching stuck rides:', error);
@@ -352,18 +410,37 @@ export class RidesService {
         .from('rides')
         .update({
           dispatch_batch: nextBatch,
-          // We update 'last_offer_sent_at' inside the SQL function,
-          // but updating it here ensures the Cron doesn't pick it up again immediately if the SQL fails.
+          // We update 'last_offer_sent_at' here so the Cron doesn't pick it up again immediately
           last_offer_sent_at: new Date().toISOString(),
         })
         .eq('id', ride.id);
 
-      // B. Trigger the SQL function to find new drivers for this batch
-      await this.supabase.rpc('find_and_offer_ride', {
-        target_ride_id: ride.id,
-      });
+      // B. Trigger the SQL function to find new drivers
+      // CRITICAL: We now capture the 'data' return value which contains the list of notified drivers
+      const { data: offeredDriverIds, error: rpcError } =
+        await this.supabase.rpc('find_and_offer_ride', {
+          target_ride_id: ride.id,
+        });
 
-      this.logger.log(`Ride ${ride.id} promoted to Batch ${nextBatch}`);
+      if (rpcError) {
+        this.logger.error(`Error dispatching ride ${ride.id}:`, rpcError);
+      } else {
+        this.logger.log(
+          `Ride ${ride.id} promoted to Batch ${nextBatch}. Notified ${
+            offeredDriverIds?.length || 0
+          } drivers.`,
+        );
+
+        // C. Send "Wake Up" Pushes to the drivers who just got the offer
+        if (
+          offeredDriverIds &&
+          Array.isArray(offeredDriverIds) &&
+          offeredDriverIds.length > 0
+        ) {
+          // We don't await this to keep the loop moving fast
+          this.sendDriverPush(offeredDriverIds, ride.id);
+        }
+      }
     }
   }
 }
