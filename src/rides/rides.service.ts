@@ -38,11 +38,59 @@ export class RidesService {
       throw new BadRequestException(`Invalid GPS coordinates: ${lat}, ${lng}`);
     }
   }
+
+  private getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
+    var R = 6371; // Radius of the earth in km
+    var dLat = this.deg2rad(lat2 - lat1);
+    var dLon = this.deg2rad(lon2 - lon1);
+    var a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(this.deg2rad(lat1)) *
+        Math.cos(this.deg2rad(lat1)) *
+        Math.sin(dLon / 2) *
+        Math.sin(dLon / 2);
+    var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    var d = R * c; // Distance in km
+    return d * 1000; // Return meters
+  }
+
+  private deg2rad(deg) {
+    return deg * (Math.PI / 180);
+  }
   async updateRideStatus(
     rideId: string,
     driverId: string,
     status: 'ARRIVED' | 'IN_PROGRESS' | 'COMPLETED',
   ) {
+    if (status === 'ARRIVED') {
+      // A. Get Ride & Driver Location
+      const { data: ride } = await this.supabase
+        .from('rides')
+        .select('pickup_lat, pickup_lng')
+        .eq('id', rideId)
+        .single();
+      const { data: driverLoc } = await this.supabase
+        .from('driver_locations')
+        .select('lat, lng')
+        .eq('driver_id', driverId)
+        .single();
+
+      if (ride && driverLoc) {
+        const distance = this.getDistanceFromLatLonInKm(
+          driverLoc.lat,
+          driverLoc.lng,
+          ride.pickup_lat,
+          ride.pickup_lng,
+        );
+
+        // B. If driver is more than 300 meters away, reject it
+        if (distance > 300) {
+          throw new BadRequestException(
+            `You are too far from pickup (${Math.round(distance)}m). Get closer to mark Arrived.`,
+          );
+        }
+      }
+    }
     console.log(`Driver ${driverId} updating ride ${rideId} to ${status}`);
 
     const { data, error } = await this.supabase
@@ -64,6 +112,14 @@ export class RidesService {
     }
 
     return { success: true, ride: data };
+  }
+
+  async removeDriverLocation(driverId: string) {
+    await this.supabase
+      .from('driver_locations')
+      .delete()
+      .eq('driver_id', driverId);
+    return { success: true };
   }
 
   async updateDriverLocation(driverId: string, lat: number, lng: number) {

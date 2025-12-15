@@ -26,7 +26,6 @@ export class RidesController {
   }
 
   @Post('update-location')
-  @Post('update-location')
   updateLocation(@Body() body: any) {
     // Check if it's a single update (old app version) or batch (new app version)
     if (Array.isArray(body.locations)) {
@@ -70,5 +69,11 @@ export class RidesController {
       body.driverId,
       'COMPLETED',
     );
+  }
+
+  @Post('go-offline')
+  async goOffline(@Body() body: any) {
+    // Use Supabase directly here or add a service method
+    return this.ridesService.removeDriverLocation(body.driverId);
   }
 }
