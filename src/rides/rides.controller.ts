@@ -40,6 +40,7 @@ export class RidesController {
       body.driverId,
       body.lat,
       body.lng,
+      body.heading,
     );
   }
   // Add inside RidesController class
