@@ -509,17 +509,14 @@ export class RidesService {
   async updateDriverLocationBatch(driverId: string, locations: any[]) {
     if (!locations || locations.length === 0) return { success: true };
 
-    // 1. Get the latest location (usually the last one in the array)
+    // 1. Get the latest location
     const latest = locations[locations.length - 1];
 
     try {
       this.validateCoordinates(latest.lat, latest.lng);
-
-      // 2. Calculate H3 for the *latest* location only
-      // (We only need the current H3 for dispatching, we don't need history of H3)
       const h3Index = latLngToCell(latest.lat, latest.lng, 8);
 
-      // 3. Upsert the LATEST position to 'driver_locations' (Fast table for dispatch)
+      // 2. Upsert with HEADING
       const { error: liveError } = await this.supabase
         .from('driver_locations')
         .upsert(
@@ -527,6 +524,7 @@ export class RidesService {
             driver_id: driverId,
             lat: latest.lat,
             lng: latest.lng,
+            heading: latest.heading || 0, // <--- ADD THIS LINE
             current_h3_index: h3Index,
             updated_at: new Date().toISOString(),
           },
@@ -534,18 +532,6 @@ export class RidesService {
         );
 
       if (liveError) throw liveError;
-
-      // 4. (Optional) Archival: If you keep a history table 'driver_location_history'
-      // You can bulk insert the full array here for playback later.
-      /*
-      const historyRecords = locations.map(loc => ({
-        driver_id: driverId,
-        lat: loc.lat,
-        lng: loc.lng,
-        recorded_at: loc.timestamp
-      }));
-      await this.supabase.from('driver_location_history').insert(historyRecords);
-      */
 
       return { success: true };
     } catch (err) {
