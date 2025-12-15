@@ -16,8 +16,8 @@ export class RidesController {
       body.passengerId,
       body.pickup,
       body.dropoff,
-      body.pickupAddress, 
-      body.dropoffAddress
+      body.pickupAddress,
+      body.dropoffAddress,
     );
   }
   @Post('accept')
@@ -26,7 +26,17 @@ export class RidesController {
   }
 
   @Post('update-location')
+  @Post('update-location')
   updateLocation(@Body() body: any) {
+    // Check if it's a single update (old app version) or batch (new app version)
+    if (Array.isArray(body.locations)) {
+      return this.ridesService.updateDriverLocationBatch(
+        body.driverId,
+        body.locations,
+      );
+    }
+
+    // Fallback for older app versions
     return this.ridesService.updateDriverLocation(
       body.driverId,
       body.lat,

@@ -384,7 +384,7 @@ export class RidesService {
 
     // LATENCY BUFFER: We wait 20 seconds (Server) vs 15 seconds (Client)
     // This gives a 5-second safety window for network delays.
-    const twentySecondsAgo = new Date(Date.now() - 20 * 1000).toISOString();
+    const twentySecondsAgo = new Date(Date.now() - 310 * 1000).toISOString();
 
     const { data: stuckRides, error } = await this.supabase
       .from('rides')
@@ -441,6 +441,53 @@ export class RidesService {
           this.sendDriverPush(offeredDriverIds, ride.id);
         }
       }
+    }
+  }
+
+  async updateDriverLocationBatch(driverId: string, locations: any[]) {
+    if (!locations || locations.length === 0) return { success: true };
+
+    // 1. Get the latest location (usually the last one in the array)
+    const latest = locations[locations.length - 1];
+
+    try {
+      this.validateCoordinates(latest.lat, latest.lng);
+
+      // 2. Calculate H3 for the *latest* location only
+      // (We only need the current H3 for dispatching, we don't need history of H3)
+      const h3Index = latLngToCell(latest.lat, latest.lng, 8);
+
+      // 3. Upsert the LATEST position to 'driver_locations' (Fast table for dispatch)
+      const { error: liveError } = await this.supabase
+        .from('driver_locations')
+        .upsert(
+          {
+            driver_id: driverId,
+            lat: latest.lat,
+            lng: latest.lng,
+            current_h3_index: h3Index,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'driver_id' },
+        );
+
+      if (liveError) throw liveError;
+
+      // 4. (Optional) Archival: If you keep a history table 'driver_location_history'
+      // You can bulk insert the full array here for playback later.
+      /*
+      const historyRecords = locations.map(loc => ({
+        driver_id: driverId,
+        lat: loc.lat,
+        lng: loc.lng,
+        recorded_at: loc.timestamp
+      }));
+      await this.supabase.from('driver_location_history').insert(historyRecords);
+      */
+
+      return { success: true };
+    } catch (err) {
+      this.handleError(err, 'updateDriverLocationBatch');
     }
   }
 }
