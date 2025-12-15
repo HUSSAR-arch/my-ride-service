@@ -122,7 +122,12 @@ export class RidesService {
     return { success: true };
   }
 
-  async updateDriverLocation(driverId: string, lat: number, lng: number) {
+  async updateDriverLocation(
+    driverId: string,
+    lat: number,
+    lng: number,
+    heading: any,
+  ) {
     try {
       // FIX 1: Validate input before H3 calculation
       this.validateCoordinates(lat, lng);
@@ -136,6 +141,7 @@ export class RidesService {
           driver_id: driverId,
           lat: lat,
           lng: lng,
+          heading: heading,
           current_h3_index: h3Index,
           updated_at: new Date().toISOString(),
         },
