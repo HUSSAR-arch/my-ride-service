@@ -11,13 +11,13 @@ export class RidesController {
       throw new BadRequestException('Invalid request body');
     }
 
-    // Update: Removed 'body.fare' from the arguments list
     return this.ridesService.requestRide(
       body.passengerId,
       body.pickup,
       body.dropoff,
       body.pickupAddress,
       body.dropoffAddress,
+      body.paymentMethod, // <--- ✅ ADD THIS LINE
       body.note,
     );
   }

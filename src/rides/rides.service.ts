@@ -111,6 +111,18 @@ export class RidesService {
       );
     }
 
+    if (status === 'COMPLETED') {
+      // We need to know the payment method and fare, so ensure 'data' (the updated ride) has these fields
+      if (data.payment_method === 'WALLET') {
+        await this.processWalletPayment(
+          data.id,
+          data.fare_estimate,
+          data.passenger_id,
+          driverId,
+        );
+      }
+    }
+
     return { success: true, ride: data };
   }
 
@@ -160,8 +172,9 @@ export class RidesService {
     passengerId: string,
     pickup: { lat: number; lng: number },
     dropoff: { lat: number; lng: number },
-    pickupAddress: string, // <--- ADD ARGUMENT
-    dropoffAddress: string, // <--- ADD ARGUMENT
+    pickupAddress: string,
+    dropoffAddress: string,
+    paymentMethod: 'CASH' | 'WALLET' = 'CASH', // <--- ✅ ACCEPT ARGUMENT
     note?: string,
   ) {
     console.log('🛑 SERVICE HIT! 🛑');
@@ -194,6 +207,20 @@ export class RidesService {
         throw new BadRequestException(
           'Could not calculate fare for this route.',
         );
+      }
+      if (paymentMethod === 'WALLET') {
+        const { data: profile } = await this.supabase
+          .from('profiles')
+          .select('balance')
+          .eq('id', passengerId)
+          .single();
+
+        // If balance is less than fare, block the request
+        if (!profile || profile.balance < calculatedFare) {
+          throw new BadRequestException(
+            `Insufficient balance. Fare: ${calculatedFare} DZD, You have: ${profile?.balance || 0} DZD`,
+          );
+        }
       }
 
       console.log(`Secure Fare Calculated: ${calculatedFare} DZD`);
@@ -539,5 +566,37 @@ export class RidesService {
     } catch (err) {
       this.handleError(err, 'updateDriverLocationBatch');
     }
+  }
+
+  private async processWalletPayment(
+    rideId: string,
+    fare: number,
+    passengerId: string,
+    driverId: string,
+  ) {
+    this.logger.log(`💰 Processing Wallet Payment: ${fare} DZD`);
+
+    // 1. Deduct from Passenger
+    const { error: pError } = await this.supabase.rpc('decrement_balance', {
+      user_id: passengerId,
+      amount: fare,
+    });
+
+    if (pError) {
+      this.logger.error('Failed to deduct from passenger', pError);
+      // In a real app, you might want to flag this for manual review
+    }
+
+    // 2. Add to Driver
+    const { error: dError } = await this.supabase.rpc('increment_balance', {
+      user_id: driverId,
+      amount: fare,
+    });
+
+    // 3. Mark Ride as Paid
+    await this.supabase
+      .from('rides')
+      .update({ payment_status: 'PAID' })
+      .eq('id', rideId);
   }
 }
