@@ -162,6 +162,7 @@ export class RidesService {
     dropoff: { lat: number; lng: number },
     pickupAddress: string, // <--- ADD ARGUMENT
     dropoffAddress: string, // <--- ADD ARGUMENT
+    note?: string,
   ) {
     console.log('🛑 SERVICE HIT! 🛑');
     console.log('Pickup Addr:', pickupAddress);
@@ -217,6 +218,7 @@ export class RidesService {
           fare_estimate: calculatedFare,
           status: 'PENDING',
           nearby_h3_indices: nearbyIndices,
+          note: note || null,
 
           // ✅ Initialize Batch Logic
           dispatch_batch: 1,

@@ -18,6 +18,7 @@ export class RidesController {
       body.dropoff,
       body.pickupAddress,
       body.dropoffAddress,
+      body.note,
     );
   }
   @Post('accept')
