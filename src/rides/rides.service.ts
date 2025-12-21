@@ -124,32 +124,6 @@ export class RidesService {
       }
     }
 
-    if (status === 'COMPLETED' && data.payment_method === 'WALLET') {
-      console.log(`💸 Processing Wallet Payment: ${data.fare_estimate} DZD`);
-
-      // A. Deduct from Passenger
-      const { error: pError } = await this.supabase.rpc('decrement_balance', {
-        user_id: data.passenger_id,
-        amount: data.fare_estimate,
-      });
-
-      if (pError) console.error('❌ Failed to deduct from passenger:', pError);
-
-      // B. Add to Driver
-      const { error: dError } = await this.supabase.rpc('increment_balance', {
-        user_id: driverId,
-        amount: data.fare_estimate,
-      });
-
-      if (dError) console.error('❌ Failed to pay driver:', dError);
-
-      // C. (Optional) Mark ride as fully paid
-      await this.supabase
-        .from('rides')
-        .update({ payment_status: 'PAID' })
-        .eq('id', rideId);
-    }
-
     return { success: true, ride: data };
   }
 
