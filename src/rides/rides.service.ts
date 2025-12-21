@@ -7,7 +7,6 @@ import {
 } from '@nestjs/common';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { latLngToCell, gridDisk } from 'h3-js';
-
 import { Cron, CronExpression } from '@nestjs/schedule';
 
 @Injectable()
@@ -57,6 +56,8 @@ export class RidesService {
   private deg2rad(deg) {
     return deg * (Math.PI / 180);
   }
+
+  // --- MAIN STATUS UPDATE LOGIC ---
   async updateRideStatus(
     rideId: string,
     driverId: string,
@@ -112,8 +113,8 @@ export class RidesService {
       );
     }
 
+    // ✅ NEW LOGIC: Handle Payments based on method
     if (status === 'COMPLETED') {
-      // We need to know the payment method and fare, so ensure 'data' (the updated ride) has these fields
       if (data.payment_method === 'WALLET') {
         await this.processWalletPayment(
           data.id,
@@ -121,11 +122,101 @@ export class RidesService {
           data.passenger_id,
           driverId,
         );
+      } else if (data.payment_method === 'CASH') {
+        await this.processCashCommission(data.id, data.fare_estimate, driverId);
       }
     }
 
     return { success: true, ride: data };
   }
+
+  // --- PAYMENT HELPERS ---
+
+  private async processWalletPayment(
+    rideId: string,
+    fare: number,
+    passengerId: string,
+    driverId: string,
+  ) {
+    this.logger.log(`💰 Processing Wallet Payment: ${fare} DZD`);
+
+    // 1. Deduct FULL FARE from Passenger
+    const { error: pError } = await this.supabase.rpc('decrement_balance', {
+      user_id: passengerId,
+      amount: fare,
+    });
+
+    if (pError) {
+      this.logger.error('Failed to deduct from passenger', pError);
+      // TODO: Handle failure (e.g., mark ride as "PAYMENT_FAILED")
+      return;
+    }
+
+    // 2. Calculate Driver Earnings (Fare - 12%)
+    const commission = fare * 0.12;
+    const driverEarnings = fare - commission;
+
+    // 3. Add NET EARNINGS to Driver
+    const { error: dError } = await this.supabase.rpc('increment_balance', {
+      user_id: driverId,
+      amount: driverEarnings,
+    });
+
+    if (dError) {
+      this.logger.error('Failed to pay driver', dError);
+    }
+
+    // 4. Record the Commission Transaction
+    await this.supabase.from('transactions').insert({
+      driver_id: driverId,
+      amount: -commission,
+      description: 'Ride Commission (12%) - Wallet Ride',
+      ride_id: rideId,
+    });
+
+    // 5. Mark Ride as Paid
+    await this.supabase
+      .from('rides')
+      .update({ payment_status: 'PAID' })
+      .eq('id', rideId);
+  }
+
+  private async processCashCommission(
+    rideId: string,
+    fare: number,
+    driverId: string,
+  ) {
+    this.logger.log(`💵 Processing Cash Commission for: ${fare} DZD`);
+
+    const commission = fare * 0.12;
+
+    // 1. Deduct Commission from Driver's Balance
+    // (We use 'decrement_balance' because they owe us this money)
+    const { error } = await this.supabase.rpc('decrement_balance', {
+      user_id: driverId,
+      amount: commission,
+    });
+
+    if (error) {
+      this.logger.error('Failed to deduct commission from driver', error);
+    }
+
+    // 2. Record Transaction
+    await this.supabase.from('transactions').insert({
+      driver_id: driverId,
+      amount: -commission,
+      description: 'Ride Commission (12%) - Cash Ride',
+      ride_id: rideId,
+    });
+
+    // 3. Mark Ride as Paid (Driver collected cash)
+    await this.supabase
+      .from('rides')
+      .update({ payment_status: 'PAID' })
+      .eq('id', rideId);
+  }
+
+  // --- OTHER SERVICE METHODS ---
 
   async removeDriverLocation(driverId: string) {
     await this.supabase
@@ -175,7 +266,7 @@ export class RidesService {
     dropoff: { lat: number; lng: number },
     pickupAddress: string,
     dropoffAddress: string,
-    paymentMethod: 'CASH' | 'WALLET' = 'CASH', // <--- ✅ ACCEPT ARGUMENT
+    paymentMethod: 'CASH' | 'WALLET' = 'CASH',
     note?: string,
   ) {
     console.log('🛑 SERVICE HIT! 🛑');
@@ -194,7 +285,6 @@ export class RidesService {
       this.validateCoordinates(dropoff.lat, dropoff.lng);
 
       // 2. SECURITY: Calculate Fare on Server
-      // We call your existing SQL function directly from here.
       const { data: calculatedFare, error: fareError } =
         await this.supabase.rpc('calculate_fare_estimate', {
           pickup_lat: pickup.lat,
@@ -240,8 +330,8 @@ export class RidesService {
           dropoff_lat: dropoff.lat,
           dropoff_lng: dropoff.lng,
 
-          pickup_address: pickupAddress, // <--- Must match variable name
-          dropoff_address: dropoffAddress, // <--- Must match variable name
+          pickup_address: pickupAddress,
+          dropoff_address: dropoffAddress,
 
           fare_estimate: calculatedFare,
           status: 'PENDING',
@@ -286,7 +376,6 @@ export class RidesService {
         .single();
 
       if (error || !data) {
-        // If Supabase has a network error, it might end up here
         if (error) throw error;
         throw new BadRequestException(
           'Ride is no longer available or already accepted.',
@@ -295,11 +384,10 @@ export class RidesService {
       const { data: passenger } = await this.supabase
         .from('profiles')
         .select('push_token')
-        .eq('id', data.passenger_id) // Use data.passenger_id from the updated ride
+        .eq('id', data.passenger_id)
         .single();
 
       if (passenger?.push_token) {
-        // We don't await this so it doesn't block the response
         this.sendPushNotification(
           passenger.push_token,
           'Yalla! Driver Found 🚗',
@@ -313,6 +401,7 @@ export class RidesService {
       this.handleError(err, 'acceptRide');
     }
   }
+
   private async sendPushNotification(
     expoPushToken: string,
     title: string,
@@ -345,11 +434,11 @@ export class RidesService {
       console.error('Error sending push notification:', error);
     }
   }
+
   // --- HELPER: Centralized Error Handling ---
   private handleError(err: any, context: string) {
     console.error(`Crash in ${context}:`, err);
 
-    // FIX 2: Detect Cloudflare HTML errors
     const errorMessage = err.message || JSON.stringify(err);
     if (
       errorMessage.includes('<!DOCTYPE html>') ||
@@ -363,7 +452,6 @@ export class RidesService {
       );
     }
 
-    // Re-throw NestJS exceptions (like BadRequest)
     if (
       err instanceof BadRequestException ||
       err instanceof ServiceUnavailableException
@@ -371,7 +459,6 @@ export class RidesService {
       throw err;
     }
 
-    // Default to 500
     throw new InternalServerErrorException(
       'An internal error occurred processing the ride.',
     );
@@ -381,11 +468,9 @@ export class RidesService {
   async handleStaleRides() {
     this.logger.log('🕵️ Cron Job: Checking for stuck rides...');
 
-    // Define "Stale" as any ride created more than 2 minutes ago that is still PENDING
     const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
 
     try {
-      // 1. Cancel the stuck rides in the database
       const { data, error } = await this.supabase
         .from('rides')
         .update({
@@ -402,7 +487,6 @@ export class RidesService {
         this.logger.warn(`⚠️ Timeout: Cancelled ${data.length} stuck rides.`);
       }
 
-      // 2. Clean up old offers
       const { error: rpcError } = await this.supabase.rpc(
         'cleanup_expired_offers',
       );
@@ -419,7 +503,6 @@ export class RidesService {
     if (!driverIds || driverIds.length === 0) return;
 
     try {
-      // 1. Fetch Push Tokens for these drivers
       const { data: drivers, error } = await this.supabase
         .from('profiles')
         .select('push_token')
@@ -432,8 +515,6 @@ export class RidesService {
       }
       if (!drivers || drivers.length === 0) return;
 
-      // 2. Prepare Expo Messages
-      // Filter out empty tokens just in case
       const validTokens = drivers
         .map((d) => d.push_token)
         .filter((t) => t && t.startsWith('ExponentPushToken'));
@@ -445,14 +526,11 @@ export class RidesService {
         sound: 'default',
         title: 'New Ride Request 🚖',
         body: 'Tap to accept immediately!',
-        data: { rideId: rideId, type: 'NEW_OFFER' }, // Critical for "tap to open" logic
+        data: { rideId: rideId, type: 'NEW_OFFER' },
         priority: 'high',
-        channelId: 'ride-requests-v4', // Must match the channel ID in your frontend
+        channelId: 'ride-requests-v4',
       }));
 
-      // 3. Send to Expo (Using simple fetch for valid chunks)
-      // Note: Expo recommends chunking arrays > 100 items.
-      // For this scale, a direct send is usually fine.
       await fetch('https://exp.host/--/api/v2/push/send', {
         method: 'POST',
         headers: {
@@ -473,10 +551,6 @@ export class RidesService {
 
   @Cron('*/10 * * * * *') // Every 10 seconds
   async handleDispatchWaves() {
-    // 1. Find rides that are stuck in PENDING and need a new batch
-
-    // LATENCY BUFFER: We wait 20 seconds (Server) vs 15 seconds (Client)
-    // This gives a 5-second safety window for network delays.
     const twentySecondsAgo = new Date(Date.now() - 310 * 1000).toISOString();
 
     const { data: stuckRides, error } = await this.supabase
@@ -495,21 +569,16 @@ export class RidesService {
     this.logger.log(`🌊 Processing waves for ${stuckRides.length} rides...`);
 
     for (const ride of stuckRides) {
-      // Cap the batch level at 3 so we don't increment forever
       const nextBatch = ride.dispatch_batch >= 3 ? 3 : ride.dispatch_batch + 1;
 
-      // A. Update the batch level in DB
       await this.supabase
         .from('rides')
         .update({
           dispatch_batch: nextBatch,
-          // We update 'last_offer_sent_at' here so the Cron doesn't pick it up again immediately
           last_offer_sent_at: new Date().toISOString(),
         })
         .eq('id', ride.id);
 
-      // B. Trigger the SQL function to find new drivers
-      // CRITICAL: We now capture the 'data' return value which contains the list of notified drivers
       const { data: offeredDriverIds, error: rpcError } =
         await this.supabase.rpc('find_and_offer_ride', {
           target_ride_id: ride.id,
@@ -524,13 +593,11 @@ export class RidesService {
           } drivers.`,
         );
 
-        // C. Send "Wake Up" Pushes to the drivers who just got the offer
         if (
           offeredDriverIds &&
           Array.isArray(offeredDriverIds) &&
           offeredDriverIds.length > 0
         ) {
-          // We don't await this to keep the loop moving fast
           this.sendDriverPush(offeredDriverIds, ride.id);
         }
       }
@@ -540,14 +607,12 @@ export class RidesService {
   async updateDriverLocationBatch(driverId: string, locations: any[]) {
     if (!locations || locations.length === 0) return { success: true };
 
-    // 1. Get the latest location
     const latest = locations[locations.length - 1];
 
     try {
       this.validateCoordinates(latest.lat, latest.lng);
       const h3Index = latLngToCell(latest.lat, latest.lng, 8);
 
-      // 2. Upsert with HEADING
       const { error: liveError } = await this.supabase
         .from('driver_locations')
         .upsert(
@@ -555,7 +620,7 @@ export class RidesService {
             driver_id: driverId,
             lat: latest.lat,
             lng: latest.lng,
-            heading: latest.heading || 0, // <--- ADD THIS LINE
+            heading: latest.heading || 0,
             current_h3_index: h3Index,
             updated_at: new Date().toISOString(),
           },
@@ -568,37 +633,5 @@ export class RidesService {
     } catch (err) {
       this.handleError(err, 'updateDriverLocationBatch');
     }
-  }
-
-  private async processWalletPayment(
-    rideId: string,
-    fare: number,
-    passengerId: string,
-    driverId: string,
-  ) {
-    this.logger.log(`💰 Processing Wallet Payment: ${fare} DZD`);
-
-    // 1. Deduct from Passenger
-    const { error: pError } = await this.supabase.rpc('decrement_balance', {
-      user_id: passengerId,
-      amount: fare,
-    });
-
-    if (pError) {
-      this.logger.error('Failed to deduct from passenger', pError);
-      // In a real app, you might want to flag this for manual review
-    }
-
-    // 2. Add to Driver
-    const { error: dError } = await this.supabase.rpc('increment_balance', {
-      user_id: driverId,
-      amount: fare,
-    });
-
-    // 3. Mark Ride as Paid
-    await this.supabase
-      .from('rides')
-      .update({ payment_status: 'PAID' })
-      .eq('id', rideId);
   }
 }
