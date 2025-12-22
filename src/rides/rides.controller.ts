@@ -26,6 +26,14 @@ export class RidesController {
     return this.ridesService.acceptRide(body.rideId, body.driverId);
   }
 
+  @Post('cancel/no-show')
+  async chargeNoShow(@Body() body: any) {
+    if (!body.rideId || !body.driverId) {
+      throw new BadRequestException('Ride ID and Driver ID are required');
+    }
+    return this.ridesService.processNoShowFee(body.rideId, body.driverId);
+  }
+
   @Post('update-location')
   updateLocation(@Body() body: any) {
     // Check if it's a single update (old app version) or batch (new app version)

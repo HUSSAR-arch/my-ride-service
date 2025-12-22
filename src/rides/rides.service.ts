@@ -634,4 +634,91 @@ export class RidesService {
       this.handleError(err, 'updateDriverLocationBatch');
     }
   }
+  async processNoShowFee(rideId: string, driverId: string) {
+    const NO_SHOW_FEE = 150; // Amount in DZD to charge passenger
+    const COMMISSION_RATE = 0.12; // Platform takes 12%
+
+    this.logger.log(`🚫 Processing No-Show for Ride ${rideId}`);
+
+    // 1. Verify Ride Status (Security Check)
+    const { data: ride, error: rideError } = await this.supabase
+      .from('rides')
+      .select('status, passenger_id, payment_method')
+      .eq('id', rideId)
+      .eq('driver_id', driverId)
+      .single();
+
+    if (rideError || !ride) {
+      throw new BadRequestException('Ride not found or access denied.');
+    }
+
+    if (ride.status !== 'ARRIVED') {
+      throw new BadRequestException(
+        'Ride must be in ARRIVED status to charge no-show.',
+      );
+    }
+
+    // 2. Update Status to CANCELLED
+    const { error: updateError } = await this.supabase
+      .from('rides')
+      .update({
+        status: 'CANCELLED',
+        cancellation_reason: 'PASSENGER_NO_SHOW',
+        payment_status: 'PAID', // Marked paid because we are forcing the transaction below
+        fare_estimate: NO_SHOW_FEE, // Update final fare to the penalty amount
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', rideId);
+
+    if (updateError) {
+      throw new InternalServerErrorException('Failed to cancel ride.');
+    }
+
+    // 3. FINANCIAL TRANSACTIONS
+    // Regardless of Cash/Wallet ride, no cash was exchanged.
+    // We must deduct from Passenger Wallet and Credit Driver Wallet.
+
+    // A. Deduct Fee from Passenger (Creates debt if balance is low)
+    const { error: pError } = await this.supabase.rpc('decrement_balance', {
+      user_id: ride.passenger_id,
+      amount: NO_SHOW_FEE,
+    });
+
+    if (pError)
+      this.logger.error('Failed to charge passenger no-show fee', pError);
+
+    // B. Calculate Driver Payout (Fee - Commission)
+    const commission = NO_SHOW_FEE * COMMISSION_RATE;
+    const driverEarnings = NO_SHOW_FEE - commission;
+
+    // C. Credit Driver
+    const { error: dError } = await this.supabase.rpc('increment_balance', {
+      user_id: driverId,
+      amount: driverEarnings,
+    });
+
+    if (dError)
+      this.logger.error('Failed to credit driver no-show fee', dError);
+
+    // 4. Log Transactions for History
+    await this.supabase.from('transactions').insert([
+      {
+        driver_id: driverId,
+        passenger_id: ride.passenger_id, // Optional: link to passenger if your schema supports it
+        amount: driverEarnings, // Positive for driver
+        description: 'Compensation: Passenger No-Show',
+        ride_id: rideId,
+        type: 'CREDIT',
+      },
+      {
+        driver_id: null, // Platform earnings
+        amount: commission,
+        description: 'Commission: No-Show Fee',
+        ride_id: rideId,
+        type: 'COMMISSION',
+      },
+    ]);
+
+    return { success: true, message: 'No-show processed successfully' };
+  }
 }
