@@ -268,6 +268,7 @@ export class RidesService {
     dropoffAddress: string,
     paymentMethod: 'CASH' | 'WALLET' = 'CASH',
     note?: string,
+    offeredFare?: number, // <--- ✅ 1. Accept optional custom fare
   ) {
     console.log('🛑 SERVICE HIT! 🛑');
     console.log('Pickup Addr:', pickupAddress);
@@ -284,8 +285,11 @@ export class RidesService {
       this.validateCoordinates(pickup.lat, pickup.lng);
       this.validateCoordinates(dropoff.lat, dropoff.lng);
 
-      // 2. SECURITY: Calculate Fare on Server
-      const { data: calculatedFare, error: fareError } =
+      // 2. SECURITY: Calculate Floor Price on Server
+      const {
+        data: floorPrice,
+        error: fareError,
+      } = // <--- Renamed variable for clarity
         await this.supabase.rpc('calculate_fare_estimate', {
           pickup_lat: pickup.lat,
           pickup_lng: pickup.lng,
@@ -293,12 +297,31 @@ export class RidesService {
           dropoff_lng: dropoff.lng,
         });
 
-      if (fareError || !calculatedFare) {
+      if (fareError || !floorPrice) {
         console.error('Fare Calculation Failed:', fareError);
         throw new BadRequestException(
           'Could not calculate fare for this route.',
         );
       }
+
+      // ✅ 3. HYBRID PRICING LOGIC
+      // If user offers a price, take the higher of the two.
+      // This prevents undercutting but allows "bidding up".
+      let finalPrice = floorPrice;
+
+      if (offeredFare && typeof offeredFare === 'number') {
+        if (offeredFare > floorPrice) {
+          console.log(`🚀 User boosted price: ${floorPrice} -> ${offeredFare}`);
+          finalPrice = offeredFare;
+        } else {
+          console.log(
+            `🛡️ User offer too low (${offeredFare}). Enforcing floor: ${floorPrice}`,
+          );
+          // We keep finalPrice as floorPrice
+        }
+      }
+
+      // 4. Wallet Balance Check (Using finalPrice)
       if (paymentMethod === 'WALLET') {
         const { data: profile } = await this.supabase
           .from('profiles')
@@ -307,20 +330,20 @@ export class RidesService {
           .single();
 
         // If balance is less than fare, block the request
-        if (!profile || profile.balance < calculatedFare) {
+        if (!profile || profile.balance < finalPrice) {
           throw new BadRequestException(
-            `Insufficient balance. Fare: ${calculatedFare} DZD, You have: ${profile?.balance || 0} DZD`,
+            `Insufficient balance. Fare: ${finalPrice} DZD, You have: ${profile?.balance || 0} DZD`,
           );
         }
       }
 
-      console.log(`Secure Fare Calculated: ${calculatedFare} DZD`);
+      console.log(`✅ Final Secure Fare: ${finalPrice} DZD`);
 
-      // 3. Calculate Search Area (H3 Hexagons)
+      // 5. Calculate Search Area (H3 Hexagons)
       const originIndex = latLngToCell(pickup.lat, pickup.lng, 8);
-      const nearbyIndices = gridDisk(originIndex, 1);
+      const nearbyIndices = gridDisk(originIndex, 10);
 
-      // 4. Insert into Supabase
+      // 6. Insert into Supabase
       const { data: rideData, error: insertError } = await this.supabase
         .from('rides')
         .insert({
@@ -333,13 +356,13 @@ export class RidesService {
           pickup_address: pickupAddress,
           dropoff_address: dropoffAddress,
 
-          fare_estimate: calculatedFare,
+          fare_estimate: finalPrice, // <--- ✅ USE FINAL PRICE HERE
           status: 'PENDING',
           payment_method: paymentMethod,
           nearby_h3_indices: nearbyIndices,
           note: note || null,
 
-          // ✅ Initialize Batch Logic
+          // Initialize Batch Logic
           dispatch_batch: 1,
           last_offer_sent_at: new Date().toISOString(),
         })
@@ -348,7 +371,7 @@ export class RidesService {
 
       if (insertError) throw insertError;
 
-      // 5. Trigger the Matcher (This sends Batch 1 immediately)
+      // 7. Trigger the Matcher
       await this.supabase.rpc('find_and_offer_ride', {
         target_ride_id: rideData.id,
       });

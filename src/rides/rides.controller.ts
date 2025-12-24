@@ -19,6 +19,7 @@ export class RidesController {
       body.dropoffAddress,
       body.paymentMethod, // <--- ✅ ADD THIS LINE
       body.note,
+      body.fare,
     );
   }
   @Post('accept')
