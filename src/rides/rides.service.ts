@@ -395,28 +395,51 @@ export class RidesService {
     }
   }
 
+  // In rides.service.ts
+
   async acceptRide(rideId: string, driverId: string) {
     console.log(`Driver ${driverId} is attempting to accept ride ${rideId}`);
 
     try {
+      // 1. Fetch the ride first to check its current status
+      const { data: ride } = await this.supabase
+        .from('rides')
+        .select('status, passenger_id, scheduled_time')
+        .eq('id', rideId)
+        .single();
+
+      if (!ride) {
+        throw new BadRequestException('Ride not found.');
+      }
+
+      // 2. Validate availability
+      if (ride.status !== 'PENDING' && ride.status !== 'SCHEDULED') {
+        throw new BadRequestException('Ride is no longer available.');
+      }
+
+      // 3. Determine New Status
+      // If it's a scheduled ride, we keep it as 'SCHEDULED' but assign the driver.
+      // If it's a live 'PENDING' ride, it becomes 'ACCEPTED'.
+      const newStatus = ride.status === 'SCHEDULED' ? 'SCHEDULED' : 'ACCEPTED';
+
+      // 4. Update the Ride
       const { data, error } = await this.supabase
         .from('rides')
         .update({
-          status: 'ACCEPTED',
+          status: newStatus,
           driver_id: driverId,
           updated_at: new Date().toISOString(),
         })
         .eq('id', rideId)
-        .eq('status', 'PENDING')
+        .is('driver_id', null) // Ensure no one else took it in the split second
         .select()
         .single();
 
       if (error || !data) {
-        if (error) throw error;
-        throw new BadRequestException(
-          'Ride is no longer available or already accepted.',
-        );
+        throw new BadRequestException('Ride was just taken by another driver.');
       }
+
+      // 5. Send Notification to Passenger
       const { data: passenger } = await this.supabase
         .from('profiles')
         .select('push_token')
@@ -424,11 +447,17 @@ export class RidesService {
         .single();
 
       if (passenger?.push_token) {
-        this.sendPushNotification(
-          passenger.push_token,
-          'Yalla! Driver Found 🚗',
-          'A driver has accepted your request and is on the way.',
-        );
+        const isScheduled = ride.status === 'SCHEDULED';
+
+        const title = isScheduled
+          ? 'Ride Confirmed 📅'
+          : 'Yalla! Driver Found 🚗';
+
+        const body = isScheduled
+          ? `A driver has accepted your scheduled ride for ${new Date(ride.scheduled_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`
+          : 'A driver has accepted your request and is on the way.';
+
+        this.sendPushNotification(passenger.push_token, title, body);
       }
 
       console.log('Ride accepted successfully!');
