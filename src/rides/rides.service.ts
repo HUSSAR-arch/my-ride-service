@@ -269,6 +269,7 @@ export class RidesService {
     paymentMethod: 'CASH' | 'WALLET' = 'CASH',
     note?: string,
     offeredFare?: number, // <--- ✅ 1. Accept optional custom fare
+    scheduledTime?: string,
   ) {
     console.log('🛑 SERVICE HIT! 🛑');
     console.log('Pickup Addr:', pickupAddress);
@@ -357,6 +358,9 @@ export class RidesService {
           dropoff_address: dropoffAddress,
 
           fare_estimate: finalPrice, // <--- ✅ USE FINAL PRICE HERE
+
+          status: initialStatus, // <--- ✅ Uses conditional status
+          scheduled_time: scheduledTime || null, // <--- ✅ Saves time
           status: 'PENDING',
           payment_method: paymentMethod,
           nearby_h3_indices: nearbyIndices,
@@ -372,9 +376,15 @@ export class RidesService {
       if (insertError) throw insertError;
 
       // 7. Trigger the Matcher
-      await this.supabase.rpc('find_and_offer_ride', {
-        target_ride_id: rideData.id,
-      });
+      if (!scheduledTime) {
+        await this.supabase.rpc('find_and_offer_ride', {
+          target_ride_id: rideData.id,
+        });
+      } else {
+        this.logger.log(
+          `📅 Ride ${rideData.id} scheduled for ${scheduledTime}`,
+        );
+      }
 
       return rideData;
     } catch (err) {
@@ -624,6 +634,62 @@ export class RidesService {
           this.sendDriverPush(offeredDriverIds, ride.id);
         }
       }
+    }
+  }
+
+  @Cron(CronExpression.EVERY_MINUTE)
+  async activateScheduledRides() {
+    this.logger.log('⏰ Checking for scheduled rides to activate...');
+
+    // We want to activate rides 20 minutes before their scheduled time
+    const now = new Date();
+    const twentyMinutesFromNow = new Date(
+      now.getTime() + 20 * 60000,
+    ).toISOString();
+
+    try {
+      // 1. Find rides that are SCHEDULED and due soon
+      const { data: ridesToActivate, error } = await this.supabase
+        .from('rides')
+        .select('*')
+        .eq('status', 'SCHEDULED')
+        .lte('scheduled_time', twentyMinutesFromNow); // Time is <= Now + 20min
+
+      if (error) {
+        this.logger.error('Error fetching scheduled rides', error);
+        return;
+      }
+
+      if (!ridesToActivate || ridesToActivate.length === 0) return;
+
+      this.logger.log(
+        `🚀 Activating ${ridesToActivate.length} scheduled rides!`,
+      );
+
+      // 2. Loop through and activate them
+      for (const ride of ridesToActivate) {
+        // A. Update Status to PENDING (Live)
+        await this.supabase
+          .from('rides')
+          .update({
+            status: 'PENDING',
+            updated_at: new Date().toISOString(),
+            // Reset dispatch timers so it looks fresh
+            last_offer_sent_at: new Date().toISOString(),
+            dispatch_batch: 1,
+          })
+          .eq('id', ride.id);
+
+        // B. Trigger Dispatcher
+        await this.supabase.rpc('find_and_offer_ride', {
+          target_ride_id: ride.id,
+        });
+
+        // C. Notify Passenger (Optional but good UX)
+        // You can fetch passenger push token here and send "We are looking for a driver now!"
+      }
+    } catch (err) {
+      this.handleError(err, 'activateScheduledRides');
     }
   }
 
