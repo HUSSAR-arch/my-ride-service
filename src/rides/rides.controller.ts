@@ -6,6 +6,7 @@ export class RidesController {
   constructor(private readonly ridesService: RidesService) {}
 
   @Post('request')
+  
   requestRide(@Body() body: any) {
     if (!body || !body.pickup || !body.dropoff) {
       throw new BadRequestException('Invalid request body');

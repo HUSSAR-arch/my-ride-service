@@ -688,8 +688,20 @@ export class RidesService {
           target_ride_id: ride.id,
         });
 
-        // C. Notify Passenger (Optional but good UX)
-        // You can fetch passenger push token here and send "We are looking for a driver now!"
+        // C. Notify Passenger
+        const { data: passenger } = await this.supabase
+          .from('profiles')
+          .select('push_token')
+          .eq('id', ride.passenger_id)
+          .single();
+
+        if (passenger?.push_token) {
+          this.sendPushNotification(
+            passenger.push_token,
+            'Ride Activating ⏰',
+            'We are now looking for a driver for your scheduled ride.',
+          );
+        }
       }
     } catch (err) {
       this.handleError(err, 'activateScheduledRides');
