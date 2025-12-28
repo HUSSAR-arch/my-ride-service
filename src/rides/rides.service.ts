@@ -614,78 +614,80 @@ export class RidesService {
     }
   }
 
-  @Cron('*/10 * * * * *') // Every 10 seconds
-  async handleDispatchWaves() {
-    const twentySecondsAgo = new Date(Date.now() - 310 * 1000).toISOString();
+  // In rides.service.ts
 
+  @Cron('*/10 * * * * *')
+  async handleDispatchWaves() {
+    const twentySecondsAgo = new Date(Date.now() - 20 * 1000).toISOString();
+
+    // 1. ADD LIMIT: Only fetch what you can process in 10 seconds (e.g., 50 rides)
     const { data: stuckRides, error } = await this.supabase
       .from('rides')
       .select('id, dispatch_batch')
       .eq('status', 'PENDING')
-      .lt('last_offer_sent_at', twentySecondsAgo);
+      .lt('last_offer_sent_at', twentySecondsAgo)
+      .limit(50); // <--- CRITICAL FIX
 
-    if (error) {
-      this.logger.error('Error fetching stuck rides:', error);
-      return;
-    }
-
-    if (!stuckRides || stuckRides.length === 0) return;
+    if (error || !stuckRides || stuckRides.length === 0) return;
 
     this.logger.log(`🌊 Processing waves for ${stuckRides.length} rides...`);
 
-    for (const ride of stuckRides) {
-      const nextBatch = ride.dispatch_batch >= 3 ? 3 : ride.dispatch_batch + 1;
+    // 2. PARALLEL PROCESSING: Use Promise.all instead of for...of
+    await Promise.all(
+      stuckRides.map(async (ride) => {
+        try {
+          const nextBatch =
+            ride.dispatch_batch >= 3 ? 3 : ride.dispatch_batch + 1;
 
-      await this.supabase
-        .from('rides')
-        .update({
-          dispatch_batch: nextBatch,
-          last_offer_sent_at: new Date().toISOString(),
-        })
-        .eq('id', ride.id);
+          // Update Database
+          await this.supabase
+            .from('rides')
+            .update({
+              dispatch_batch: nextBatch,
+              last_offer_sent_at: new Date().toISOString(),
+            })
+            .eq('id', ride.id);
 
-      const { data: offeredDriverIds, error: rpcError } =
-        await this.supabase.rpc('find_and_offer_ride', {
-          target_ride_id: ride.id,
-        });
+          // Trigger Matching
+          const { data: offeredDriverIds } = await this.supabase.rpc(
+            'find_and_offer_ride',
+            {
+              target_ride_id: ride.id,
+            },
+          );
 
-      if (rpcError) {
-        this.logger.error(`Error dispatching ride ${ride.id}:`, rpcError);
-      } else {
-        this.logger.log(
-          `Ride ${ride.id} promoted to Batch ${nextBatch}. Notified ${
-            offeredDriverIds?.length || 0
-          } drivers.`,
-        );
-
-        if (
-          offeredDriverIds &&
-          Array.isArray(offeredDriverIds) &&
-          offeredDriverIds.length > 0
-        ) {
-          this.sendDriverPush(offeredDriverIds, ride.id);
+          // Send Notifications (Fire and forget - don't await the result)
+          if (offeredDriverIds?.length > 0) {
+            this.sendDriverPush(offeredDriverIds, ride.id).catch((e) =>
+              this.logger.error(`Push failed for ride ${ride.id}`, e),
+            );
+          }
+        } catch (err) {
+          this.logger.error(`Failed to process ride ${ride.id}`, err);
         }
-      }
-    }
+      }),
+    );
   }
-
   @Cron(CronExpression.EVERY_MINUTE)
   async activateScheduledRides() {
     this.logger.log('⏰ Checking for scheduled rides to activate...');
 
-    // We want to activate rides 20 minutes before their scheduled time
     const now = new Date();
+    // Activate rides scheduled for 20 minutes from now (or earlier)
     const twentyMinutesFromNow = new Date(
       now.getTime() + 20 * 60000,
     ).toISOString();
 
     try {
-      // 1. Find rides that are SCHEDULED and due soon
+      // 1. SCALABILITY FIX: Add .limit(50)
+      // If 10,000 rides are scheduled, we only fetch 50 at a time per minute
+      // to avoid crashing the server memory.
       const { data: ridesToActivate, error } = await this.supabase
         .from('rides')
         .select('*')
         .eq('status', 'SCHEDULED')
-        .lte('scheduled_time', twentyMinutesFromNow); // Time is <= Now + 20min
+        .lte('scheduled_time', twentyMinutesFromNow)
+        .limit(50);
 
       if (error) {
         this.logger.error('Error fetching scheduled rides', error);
@@ -698,40 +700,63 @@ export class RidesService {
         `🚀 Activating ${ridesToActivate.length} scheduled rides!`,
       );
 
-      // 2. Loop through and activate them
-      for (const ride of ridesToActivate) {
-        // A. Update Status to PENDING (Live)
-        await this.supabase
-          .from('rides')
-          .update({
-            status: 'PENDING',
-            updated_at: new Date().toISOString(),
-            // Reset dispatch timers so it looks fresh
-            last_offer_sent_at: new Date().toISOString(),
-            dispatch_batch: 1,
-          })
-          .eq('id', ride.id);
+      // 2. SCALABILITY FIX: Use Promise.all() for parallel execution
+      // This processes all 50 rides simultaneously instead of waiting one-by-one.
+      await Promise.all(
+        ridesToActivate.map(async (ride) => {
+          try {
+            // A. Update Status to PENDING (Live)
+            const { error: updateError } = await this.supabase
+              .from('rides')
+              .update({
+                status: 'PENDING',
+                updated_at: new Date().toISOString(),
+                // Reset dispatch timers so it looks like a fresh request
+                last_offer_sent_at: new Date().toISOString(),
+                dispatch_batch: 1,
+              })
+              .eq('id', ride.id);
 
-        // B. Trigger Dispatcher
-        await this.supabase.rpc('find_and_offer_ride', {
-          target_ride_id: ride.id,
-        });
+            if (updateError) throw updateError;
 
-        // C. Notify Passenger
-        const { data: passenger } = await this.supabase
-          .from('profiles')
-          .select('push_token')
-          .eq('id', ride.passenger_id)
-          .single();
+            // B. Trigger Dispatcher (Find Drivers)
+            // We don't await the result because we don't want to block if this is slow
+            this.supabase
+              .rpc('find_and_offer_ride', {
+                target_ride_id: ride.id,
+              })
+              .then(({ error }) => {
+                if (error)
+                  this.logger.error(
+                    `Failed to dispatch activated ride ${ride.id}`,
+                    error,
+                  );
+              });
 
-        if (passenger?.push_token) {
-          this.sendPushNotification(
-            passenger.push_token,
-            'Ride Activating ⏰',
-            'We are now looking for a driver for your scheduled ride.',
-          );
-        }
-      }
+            // C. Notify Passenger
+            // Fetch token separately to ensure we have the latest one
+            const { data: passenger } = await this.supabase
+              .from('profiles')
+              .select('push_token')
+              .eq('id', ride.passenger_id)
+              .single();
+
+            if (passenger?.push_token) {
+              await this.sendPushNotification(
+                passenger.push_token,
+                'Ride Activating ⏰',
+                'We are now looking for a driver for your scheduled ride.',
+              );
+            }
+          } catch (innerErr) {
+            // Catch errors for specific rides so the loop doesn't break for others
+            this.logger.error(
+              `Failed to activate scheduled ride ${ride.id}`,
+              innerErr,
+            );
+          }
+        }),
+      );
     } catch (err) {
       this.handleError(err, 'activateScheduledRides');
     }
