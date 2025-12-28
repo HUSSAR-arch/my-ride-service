@@ -20,6 +20,7 @@ export class RidesController {
       body.paymentMethod, // <--- ✅ ADD THIS LINE
       body.note,
       body.fare,
+      body.scheduledTime,
     );
   }
   @Post('accept')

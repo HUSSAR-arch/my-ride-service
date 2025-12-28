@@ -341,8 +341,12 @@ export class RidesService {
       console.log(`✅ Final Secure Fare: ${finalPrice} DZD`);
 
       // 5. Calculate Search Area (H3 Hexagons)
+      // 5. Calculate Search Area (H3 Hexagons)
       const originIndex = latLngToCell(pickup.lat, pickup.lng, 8);
       const nearbyIndices = gridDisk(originIndex, 10);
+
+      // ✅ FIX: Define status based on schedule
+      const initialStatus = scheduledTime ? 'SCHEDULED' : 'PENDING';
 
       // 6. Insert into Supabase
       const { data: rideData, error: insertError } = await this.supabase
@@ -357,16 +361,15 @@ export class RidesService {
           pickup_address: pickupAddress,
           dropoff_address: dropoffAddress,
 
-          fare_estimate: finalPrice, // <--- ✅ USE FINAL PRICE HERE
+          fare_estimate: finalPrice,
 
-          status: initialStatus, // <--- ✅ Uses conditional status
-          scheduled_time: scheduledTime || null, // <--- ✅ Saves time
-          status: 'PENDING',
+          status: initialStatus, // <--- ✅ Correctly uses the variable
+          scheduled_time: scheduledTime || null,
+
           payment_method: paymentMethod,
           nearby_h3_indices: nearbyIndices,
           note: note || null,
 
-          // Initialize Batch Logic
           dispatch_batch: 1,
           last_offer_sent_at: new Date().toISOString(),
         })
