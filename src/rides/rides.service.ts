@@ -533,8 +533,7 @@ export class RidesService {
   async handleStaleRides() {
     this.logger.log('🕵️ Cron Job: Checking for stuck rides...');
 
-    const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
     try {
       const { data, error } = await this.supabase
         .from('rides')
@@ -543,7 +542,7 @@ export class RidesService {
           updated_at: new Date().toISOString(),
         })
         .eq('status', 'PENDING')
-        .lt('created_at', twoMinutesAgo)
+        .lt('updated_at', fiveMinutesAgo)
         .select();
 
       if (error) {
