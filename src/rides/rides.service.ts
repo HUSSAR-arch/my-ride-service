@@ -669,18 +669,13 @@ export class RidesService {
   }
   @Cron(CronExpression.EVERY_MINUTE)
   async activateScheduledRides() {
-    this.logger.log('⏰ Checking for scheduled rides to activate...');
-
     const now = new Date();
-    // Activate rides scheduled for 20 minutes from now (or earlier)
+    // Look for rides scheduled within the next 20 minutes
     const twentyMinutesFromNow = new Date(
       now.getTime() + 20 * 60000,
     ).toISOString();
 
     try {
-      // 1. SCALABILITY FIX: Add .limit(50)
-      // If 10,000 rides are scheduled, we only fetch 50 at a time per minute
-      // to avoid crashing the server memory.
       const { data: ridesToActivate, error } = await this.supabase
         .from('rides')
         .select('*')
@@ -689,28 +684,25 @@ export class RidesService {
         .limit(50);
 
       if (error) {
-        this.logger.error('Error fetching scheduled rides', error);
+        this.logger.error('Error fetching scheduled rides:', error);
         return;
       }
 
       if (!ridesToActivate || ridesToActivate.length === 0) return;
 
-      this.logger.log(
-        `🚀 Activating ${ridesToActivate.length} scheduled rides!`,
-      );
+      this.logger.log(`Found ${ridesToActivate.length} rides to activate.`);
 
-      // 2. SCALABILITY FIX: Use Promise.all() for parallel execution
-      // This processes all 50 rides simultaneously instead of waiting one-by-one.
       await Promise.all(
         ridesToActivate.map(async (ride) => {
           try {
             // A. Update Status to PENDING (Live)
+            // We update 'last_offer_sent_at' and 'updated_at' to NOW so the "Stale Check" cron job
+            // sees this as a fresh ride and doesn't cancel it immediately.
             const { error: updateError } = await this.supabase
               .from('rides')
               .update({
                 status: 'PENDING',
                 updated_at: new Date().toISOString(),
-                // Reset dispatch timers so it looks like a fresh request
                 last_offer_sent_at: new Date().toISOString(),
                 dispatch_batch: 1,
               })
@@ -718,22 +710,7 @@ export class RidesService {
 
             if (updateError) throw updateError;
 
-            // B. Trigger Dispatcher (Find Drivers)
-            // We don't await the result because we don't want to block if this is slow
-            this.supabase
-              .rpc('find_and_offer_ride', {
-                target_ride_id: ride.id,
-              })
-              .then(({ error }) => {
-                if (error)
-                  this.logger.error(
-                    `Failed to dispatch activated ride ${ride.id}`,
-                    error,
-                  );
-              });
-
-            // C. Notify Passenger
-            // Fetch token separately to ensure we have the latest one
+            // B. NOTIFY PASSENGER (Always notify that ride is starting)
             const { data: passenger } = await this.supabase
               .from('profiles')
               .select('push_token')
@@ -744,15 +721,55 @@ export class RidesService {
               await this.sendPushNotification(
                 passenger.push_token,
                 'Ride Activating ⏰',
-                'We are now looking for a driver for your scheduled ride.',
+                ride.driver_id
+                  ? 'Your driver is getting ready to head to you.'
+                  : 'We are now looking for a driver for your scheduled ride.',
+              );
+            }
+
+            // C. HANDLE DRIVER LOGIC (The Critical Fix)
+            if (ride.driver_id) {
+              // CASE 1: Driver Already Assigned (Pre-booked)
+              // We DO NOT call find_and_offer_ride here.
+              // This prevents creating a "pending offer" that would expire and kill the ride.
+
+              // Instead, just notify the assigned driver to start moving.
+              const { data: driver } = await this.supabase
+                .from('profiles')
+                .select('push_token')
+                .eq('id', ride.driver_id)
+                .single();
+
+              if (driver?.push_token) {
+                await this.sendPushNotification(
+                  driver.push_token,
+                  'Scheduled Ride Starting 🏁',
+                  'Your scheduled passenger is waiting. Please head to pickup.',
+                );
+              }
+              this.logger.log(
+                `Activated pre-assigned ride ${ride.id} for driver ${ride.driver_id}`,
+              );
+            } else {
+              // CASE 2: No Driver Assigned Yet
+              // Only NOW do we trigger the marketplace to find a driver
+              this.supabase
+                .rpc('find_and_offer_ride', {
+                  target_ride_id: ride.id,
+                })
+                .then(({ error }) => {
+                  if (error)
+                    this.logger.error(
+                      `Failed to dispatch activated ride ${ride.id}`,
+                      error,
+                    );
+                });
+              this.logger.log(
+                `Activated unassigned ride ${ride.id}, searching for drivers...`,
               );
             }
           } catch (innerErr) {
-            // Catch errors for specific rides so the loop doesn't break for others
-            this.logger.error(
-              `Failed to activate scheduled ride ${ride.id}`,
-              innerErr,
-            );
+            this.logger.error(`Failed to activate ride ${ride.id}`, innerErr);
           }
         }),
       );
