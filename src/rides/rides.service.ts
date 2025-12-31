@@ -398,45 +398,62 @@ export class RidesService {
   // In rides.service.ts
 
   async acceptRide(rideId: string, driverId: string) {
-    console.log(`Driver ${driverId} is attempting to accept ride ${rideId}`);
+    this.logger.log(`Driver ${driverId} accepting ride ${rideId}`);
 
     try {
-      // 1. Fetch the ride first to check its current status
+      // 1. Fetch the ride first to check who owns it
       const { data: ride } = await this.supabase
         .from('rides')
-        .select('status, passenger_id, scheduled_time')
+        .select('status, passenger_id, driver_id, scheduled_time')
         .eq('id', rideId)
         .single();
 
-      if (!ride) {
-        throw new BadRequestException('Ride not found.');
-      }
+      if (!ride) throw new BadRequestException('Ride not found.');
 
-      // 2. Validate availability
-      if (ride.status !== 'PENDING' && ride.status !== 'SCHEDULED') {
+      // 2. Validate Status
+      // We allow PENDING, SCHEDULED, or NO_DRIVERS_AVAILABLE (for rescue)
+      const validStatuses = ['PENDING', 'SCHEDULED', 'NO_DRIVERS_AVAILABLE'];
+      if (!validStatuses.includes(ride.status)) {
         throw new BadRequestException('Ride is no longer available.');
       }
 
-      // 3. Determine New Status
-      // If it's a scheduled ride, we keep it as 'SCHEDULED' but assign the driver.
-      // If it's a live 'PENDING' ride, it becomes 'ACCEPTED'.
+      // 3. Determine Handling based on Driver ID
+      let updateQuery;
       const newStatus = ride.status === 'SCHEDULED' ? 'SCHEDULED' : 'ACCEPTED';
 
-      // 4. Update the Ride
-      const { data, error } = await this.supabase
-        .from('rides')
-        .update({
-          status: newStatus,
-          driver_id: driverId,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', rideId)
-        .is('driver_id', null) // Ensure no one else took it in the split second
-        .select()
-        .single();
+      if (ride.driver_id === driverId) {
+        // ✅ SCENARIO A: You are ALREADY the assigned driver (Scheduled Activation)
+        // We just update the status to confirm you are live.
+        updateQuery = this.supabase
+          .from('rides')
+          .update({
+            status: newStatus,
+            updated_at: new Date().toISOString(),
+            // Don't need to set driver_id, it's already you
+          })
+          .eq('id', rideId)
+          .eq('driver_id', driverId); // Security check: Ensure it's still you
+      } else {
+        // ✅ SCENARIO B: It's an open ride (New Request)
+        // We must ensure driver_id is NULL so two people don't grab it
+        updateQuery = this.supabase
+          .from('rides')
+          .update({
+            status: newStatus,
+            driver_id: driverId,
+            updated_at: new Date().toISOString(),
+            cancellation_reason: null,
+          })
+          .eq('id', rideId)
+          .is('driver_id', null); // Security check: Ensure it's empty
+      }
+
+      // 4. Execute the Query
+      const { data, error } = await updateQuery.select().single();
 
       if (error || !data) {
-        throw new BadRequestException('Ride was just taken by another driver.');
+        this.logger.error('Accept failed', error);
+        throw new BadRequestException('Ride taken or unavailable.');
       }
 
       // 5. Send Notification to Passenger
