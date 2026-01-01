@@ -376,9 +376,31 @@ export class RidesService {
 
       // 7. Trigger the Matcher
       if (!scheduledTime) {
-        await this.supabase.rpc('find_and_offer_ride', {
-          target_ride_id: rideData.id,
-        });
+        this.logger.log(
+          `⚡ Triggering immediate matcher for Ride ${rideData.id}`,
+        );
+
+        // 1. Run the Database Matcher
+        const { data: offeredDriverIds, error: rpcError } =
+          await this.supabase.rpc('find_and_offer_ride', {
+            target_ride_id: rideData.id,
+          });
+
+        if (rpcError) {
+          this.logger.error('❌ Matcher RPC failed:', rpcError);
+        } else {
+          this.logger.log(
+            `🔍 Matcher found ${offeredDriverIds?.length || 0} drivers.`,
+          );
+
+          // 2. Send Push Notification IMMEDIATELY
+          if (offeredDriverIds && offeredDriverIds.length > 0) {
+            // We don't 'await' this so the passenger gets a fast response
+            this.sendDriverPush(offeredDriverIds, rideData.id).catch((e) =>
+              this.logger.error('Failed to send immediate push', e),
+            );
+          }
+        }
       } else {
         this.logger.log(
           `📅 Ride ${rideData.id} scheduled for ${scheduledTime}`,
@@ -577,68 +599,72 @@ export class RidesService {
   }
 
   private async sendDriverPush(driverIds: string[], rideId: string) {
-  // 1. Log who we are trying to target
-  this.logger.log(`Attempting to notify drivers: ${driverIds.join(', ')}`);
+    // 1. Log who we are trying to target
+    this.logger.log(`Attempting to notify drivers: ${driverIds.join(', ')}`);
 
-  if (!driverIds || driverIds.length === 0) return;
+    if (!driverIds || driverIds.length === 0) return;
 
-  try {
-    // 2. FETCH TOKENS & LOG THE RESULT
-    const { data: drivers, error } = await this.supabase
-      .from('profiles')
-      .select('id, push_token')
-      .in('id', driverIds);
+    try {
+      // 2. FETCH TOKENS & LOG THE RESULT
+      const { data: drivers, error } = await this.supabase
+        .from('profiles')
+        .select('id, push_token')
+        .in('id', driverIds);
 
-    if (error) {
-      this.logger.error('❌ Database Error fetching tokens:', error);
-      return;
-    }
+      if (error) {
+        this.logger.error('❌ Database Error fetching tokens:', error);
+        return;
+      }
 
-    // 3. CHECK IF WE ACTUALLY FOUND TOKENS
-    const validDrivers = drivers?.filter(d => d.push_token && d.push_token.startsWith('ExponentPushToken'));
+      // 3. CHECK IF WE ACTUALLY FOUND TOKENS
+      const validDrivers = drivers?.filter(
+        (d) => d.push_token && d.push_token.startsWith('ExponentPushToken'),
+      );
 
-    if (!validDrivers || validDrivers.length === 0) {
-      this.logger.error(`❌ No valid tokens found in DB for these drivers! Check 'profiles' table.`);
-      return;
-    }
+      if (!validDrivers || validDrivers.length === 0) {
+        this.logger.error(
+          `❌ No valid tokens found in DB for these drivers! Check 'profiles' table.`,
+        );
+        return;
+      }
 
-    this.logger.log(`📲 Sending to ${validDrivers.length} devices...`);
+      this.logger.log(`📲 Sending to ${validDrivers.length} devices...`);
 
-    const messages = validDrivers.map((driver) => ({
-      to: driver.push_token,
-      sound: 'default',
-      title: 'New Ride Request 🚖',
-      body: 'Tap to accept immediately!',
-      data: { rideId: rideId, type: 'NEW_OFFER' },
-      priority: 'high',
-      channelId: 'ride-requests-v4',
-    }));
+      const messages = validDrivers.map((driver) => ({
+        to: driver.push_token,
+        sound: 'default',
+        title: 'New Ride Request 🚖',
+        body: 'Tap to accept immediately!',
+        data: { rideId: rideId, type: 'NEW_OFFER' },
+        priority: 'high',
+        channelId: 'ride-requests-v4',
+      }));
 
-    // 4. SEND AND LOG THE RESPONSE
-    const response = await fetch('https://exp.host/--/api/v2/push/send', {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Accept-encoding': 'gzip, deflate',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(messages),
-    });
+      // 4. SEND AND LOG THE RESPONSE
+      const response = await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Accept-encoding': 'gzip, deflate',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(messages),
+      });
 
-    const json = await response.json();
-    
-    // 5. CRITICAL: LOG THE EXPO ERROR
-    if (json.data && json.data.status === "error") {
+      const json = await response.json();
+
+      // 5. CRITICAL: LOG THE EXPO ERROR
+      if (json.data && json.data.status === 'error') {
         this.logger.error(`❌ PUSH FAILED: ${JSON.stringify(json.data)}`);
-    } else {
-        this.logger.log(`✅ Push Sent Successfully! Receipt: ${JSON.stringify(json.data)}`);
+      } else {
+        this.logger.log(
+          `✅ Push Sent Successfully! Receipt: ${JSON.stringify(json.data)}`,
+        );
+      }
+    } catch (err) {
+      this.logger.error('❌ CRASH in sendDriverPush:', err);
     }
-
-  } catch (err) {
-    this.logger.error('❌ CRASH in sendDriverPush:', err);
   }
-}
-
 
   // In rides.service.ts
 
