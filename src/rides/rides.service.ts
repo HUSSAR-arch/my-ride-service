@@ -577,54 +577,68 @@ export class RidesService {
   }
 
   private async sendDriverPush(driverIds: string[], rideId: string) {
-    if (!driverIds || driverIds.length === 0) return;
+  // 1. Log who we are trying to target
+  this.logger.log(`Attempting to notify drivers: ${driverIds.join(', ')}`);
 
-    try {
-      const { data: drivers, error } = await this.supabase
-        .from('profiles')
-        .select('push_token')
-        .in('id', driverIds)
-        .not('push_token', 'is', null);
+  if (!driverIds || driverIds.length === 0) return;
 
-      if (error) {
-        this.logger.error('Error fetching push tokens for dispatch:', error);
-        return;
-      }
-      if (!drivers || drivers.length === 0) return;
+  try {
+    // 2. FETCH TOKENS & LOG THE RESULT
+    const { data: drivers, error } = await this.supabase
+      .from('profiles')
+      .select('id, push_token')
+      .in('id', driverIds);
 
-      const validTokens = drivers
-        .map((d) => d.push_token)
-        .filter((t) => t && t.startsWith('ExponentPushToken'));
-
-      if (validTokens.length === 0) return;
-
-      const messages = validTokens.map((token) => ({
-        to: token,
-        sound: 'default',
-        title: 'New Ride Request 🚖',
-        body: 'Tap to accept immediately!',
-        data: { rideId: rideId, type: 'NEW_OFFER' },
-        priority: 'high',
-        channelId: 'ride-requests-v4',
-      }));
-
-      await fetch('https://exp.host/--/api/v2/push/send', {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Accept-encoding': 'gzip, deflate',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(messages),
-      });
-
-      this.logger.log(
-        `📲 Sent push notifications to ${validTokens.length} drivers.`,
-      );
-    } catch (err) {
-      this.logger.error('Failed to send driver push notifications:', err);
+    if (error) {
+      this.logger.error('❌ Database Error fetching tokens:', error);
+      return;
     }
+
+    // 3. CHECK IF WE ACTUALLY FOUND TOKENS
+    const validDrivers = drivers?.filter(d => d.push_token && d.push_token.startsWith('ExponentPushToken'));
+
+    if (!validDrivers || validDrivers.length === 0) {
+      this.logger.error(`❌ No valid tokens found in DB for these drivers! Check 'profiles' table.`);
+      return;
+    }
+
+    this.logger.log(`📲 Sending to ${validDrivers.length} devices...`);
+
+    const messages = validDrivers.map((driver) => ({
+      to: driver.push_token,
+      sound: 'default',
+      title: 'New Ride Request 🚖',
+      body: 'Tap to accept immediately!',
+      data: { rideId: rideId, type: 'NEW_OFFER' },
+      priority: 'high',
+      channelId: 'ride-requests-v4',
+    }));
+
+    // 4. SEND AND LOG THE RESPONSE
+    const response = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Accept-encoding': 'gzip, deflate',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(messages),
+    });
+
+    const json = await response.json();
+    
+    // 5. CRITICAL: LOG THE EXPO ERROR
+    if (json.data && json.data.status === "error") {
+        this.logger.error(`❌ PUSH FAILED: ${JSON.stringify(json.data)}`);
+    } else {
+        this.logger.log(`✅ Push Sent Successfully! Receipt: ${JSON.stringify(json.data)}`);
+    }
+
+  } catch (err) {
+    this.logger.error('❌ CRASH in sendDriverPush:', err);
   }
+}
+
 
   // In rides.service.ts
 
@@ -632,53 +646,65 @@ export class RidesService {
   async handleDispatchWaves() {
     const twentySecondsAgo = new Date(Date.now() - 20 * 1000).toISOString();
 
-    // 1. ADD LIMIT: Only fetch what you can process in 10 seconds (e.g., 50 rides)
+    // 1. Fetch stuck rides
     const { data: stuckRides, error } = await this.supabase
       .from('rides')
       .select('id, dispatch_batch')
       .eq('status', 'PENDING')
       .lt('last_offer_sent_at', twentySecondsAgo)
-      .limit(50); // <--- CRITICAL FIX
+      .limit(50);
 
-    if (error || !stuckRides || stuckRides.length === 0) return;
+    if (error) {
+      this.logger.error('❌ Error fetching dispatch waves:', error);
+      return;
+    }
+
+    if (!stuckRides || stuckRides.length === 0) return;
 
     this.logger.log(`🌊 Processing waves for ${stuckRides.length} rides...`);
 
-    // 2. PARALLEL PROCESSING: Use Promise.all instead of for...of
-    await Promise.all(
-      stuckRides.map(async (ride) => {
-        try {
-          const nextBatch =
-            ride.dispatch_batch >= 3 ? 3 : ride.dispatch_batch + 1;
+    // 2. Process each ride individually
+    for (const ride of stuckRides) {
+      try {
+        const nextBatch =
+          ride.dispatch_batch >= 3 ? 3 : ride.dispatch_batch + 1;
 
-          // Update Database
-          await this.supabase
-            .from('rides')
-            .update({
-              dispatch_batch: nextBatch,
-              last_offer_sent_at: new Date().toISOString(),
-            })
-            .eq('id', ride.id);
+        // A. Update Batch Count
+        await this.supabase
+          .from('rides')
+          .update({
+            dispatch_batch: nextBatch,
+            last_offer_sent_at: new Date().toISOString(),
+          })
+          .eq('id', ride.id);
 
-          // Trigger Matching
-          const { data: offeredDriverIds } = await this.supabase.rpc(
-            'find_and_offer_ride',
-            {
-              target_ride_id: ride.id,
-            },
+        // B. Find Drivers
+        const { data: offeredDriverIds, error: rpcError } =
+          await this.supabase.rpc('find_and_offer_ride', {
+            target_ride_id: ride.id,
+          });
+
+        if (rpcError) {
+          this.logger.error(
+            `❌ RPC 'find_and_offer_ride' failed for ride ${ride.id}:`,
+            rpcError,
           );
-
-          // Send Notifications (Fire and forget - don't await the result)
-          if (offeredDriverIds?.length > 0) {
-            this.sendDriverPush(offeredDriverIds, ride.id).catch((e) =>
-              this.logger.error(`Push failed for ride ${ride.id}`, e),
-            );
-          }
-        } catch (err) {
-          this.logger.error(`Failed to process ride ${ride.id}`, err);
+          continue;
         }
-      }),
-    );
+
+        // C. Send Notification
+        if (offeredDriverIds && offeredDriverIds.length > 0) {
+          // Add 'await' here so we can see the logs immediately
+          await this.sendDriverPush(offeredDriverIds, ride.id);
+        } else {
+          this.logger.warn(
+            `⚠️ No drivers found for ride ${ride.id} (Batch ${nextBatch})`,
+          );
+        }
+      } catch (err) {
+        this.logger.error(`❌ Failed to process ride ${ride.id}`, err);
+      }
+    }
   }
   @Cron(CronExpression.EVERY_MINUTE)
   async activateScheduledRides() {
