@@ -395,8 +395,12 @@ export class RidesService {
 
           // 2. Send Push Notification IMMEDIATELY
           if (offeredDriverIds && offeredDriverIds.length > 0) {
-            // We don't 'await' this so the passenger gets a fast response
-            this.sendDriverPush(offeredDriverIds, rideData.id).catch((e) =>
+            // ✅ Pass the fare (3rd argument) so the driver sees "Earn X DZD"
+            this.sendDriverPush(
+              offeredDriverIds,
+              rideData.id,
+              rideData.fare_estimate,
+            ).catch((e) =>
               this.logger.error('Failed to send immediate push', e),
             );
           }
@@ -598,14 +602,17 @@ export class RidesService {
     }
   }
 
-  private async sendDriverPush(driverIds: string[], rideId: string) {
-    // 1. Log who we are trying to target
+  // ✅ Update signature to accept 'fare'
+  private async sendDriverPush(
+    driverIds: string[],
+    rideId: string,
+    fare: number,
+  ) {
     this.logger.log(`Attempting to notify drivers: ${driverIds.join(', ')}`);
 
     if (!driverIds || driverIds.length === 0) return;
 
     try {
-      // 2. FETCH TOKENS & LOG THE RESULT
       const { data: drivers, error } = await this.supabase
         .from('profiles')
         .select('id, push_token')
@@ -616,15 +623,12 @@ export class RidesService {
         return;
       }
 
-      // 3. CHECK IF WE ACTUALLY FOUND TOKENS
       const validDrivers = drivers?.filter(
         (d) => d.push_token && d.push_token.startsWith('ExponentPushToken'),
       );
 
       if (!validDrivers || validDrivers.length === 0) {
-        this.logger.error(
-          `❌ No valid tokens found in DB for these drivers! Check 'profiles' table.`,
-        );
+        // Quietly return if no tokens found
         return;
       }
 
@@ -634,14 +638,14 @@ export class RidesService {
         to: driver.push_token,
         sound: 'default',
         title: 'New Ride Request 🚖',
-        body: 'Tap to accept immediately!',
+        // ✅ Use the fare variable here
+        body: `Earn ${fare} DZD - Tap to accept!`,
         data: { rideId: rideId, type: 'NEW_OFFER' },
         priority: 'high',
         channelId: 'ride-requests-v4',
       }));
 
-      // 4. SEND AND LOG THE RESPONSE
-      const response = await fetch('https://exp.host/--/api/v2/push/send', {
+      await fetch('https://exp.host/--/api/v2/push/send', {
         method: 'POST',
         headers: {
           Accept: 'application/json',
@@ -650,17 +654,6 @@ export class RidesService {
         },
         body: JSON.stringify(messages),
       });
-
-      const json = await response.json();
-
-      // 5. CRITICAL: LOG THE EXPO ERROR
-      if (json.data && json.data.status === 'error') {
-        this.logger.error(`❌ PUSH FAILED: ${JSON.stringify(json.data)}`);
-      } else {
-        this.logger.log(
-          `✅ Push Sent Successfully! Receipt: ${JSON.stringify(json.data)}`,
-        );
-      }
     } catch (err) {
       this.logger.error('❌ CRASH in sendDriverPush:', err);
     }
@@ -675,7 +668,7 @@ export class RidesService {
     // 1. Fetch stuck rides
     const { data: stuckRides, error } = await this.supabase
       .from('rides')
-      .select('id, dispatch_batch')
+      .select('id, dispatch_batch, fare_estimate')
       .eq('status', 'PENDING')
       .lt('last_offer_sent_at', twentySecondsAgo)
       .limit(50);
@@ -721,7 +714,11 @@ export class RidesService {
         // C. Send Notification
         if (offeredDriverIds && offeredDriverIds.length > 0) {
           // Add 'await' here so we can see the logs immediately
-          await this.sendDriverPush(offeredDriverIds, ride.id);
+          await this.sendDriverPush(
+            offeredDriverIds,
+            ride.id,
+            ride.fare_estimate,
+          );
         } else {
           this.logger.warn(
             `⚠️ No drivers found for ride ${ride.id} (Batch ${nextBatch})`,
