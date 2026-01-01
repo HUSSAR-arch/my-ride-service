@@ -86,11 +86,7 @@ export class RidesService {
         );
 
         // B. If driver is more than 300 meters away, reject it
-        if (distance > 300) {
-          throw new BadRequestException(
-            `You are too far from pickup (${Math.round(distance)}m). Get closer to mark Arrived.`,
-          );
-        }
+        console.log(`Driver is ${distance} meters away.`);
       }
     }
     console.log(`Driver ${driverId} updating ride ${rideId} to ${status}`);
