@@ -936,4 +936,41 @@ export class RidesService {
 
     return { success: true, message: 'No-show processed successfully' };
   }
+  async cancelRideByPassenger(
+    rideId: string,
+    passengerId: string,
+    reason: string,
+  ) {
+    // 1. Update DB
+    const { data: ride } = await this.supabase
+      .from('rides')
+      .update({
+        status: 'CANCELLED',
+        cancellation_reason: reason,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', rideId)
+      .eq('passenger_id', passengerId) // Security check
+      .select('driver_id') // Get the driver ID
+      .single();
+
+    // 2. Notify Driver (if one was assigned)
+    if (ride?.driver_id) {
+      const { data: driver } = await this.supabase
+        .from('profiles')
+        .select('push_token')
+        .eq('id', ride.driver_id)
+        .single();
+
+      if (driver?.push_token) {
+        await this.sendPushNotification(
+          driver.push_token,
+          'Ride Cancelled 🚫',
+          'Passenger cancelled the request. You are back online.',
+        );
+      }
+    }
+
+    return { success: true };
+  }
 }
