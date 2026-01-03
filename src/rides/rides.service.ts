@@ -58,13 +58,16 @@ export class RidesService {
   }
 
   // --- MAIN STATUS UPDATE LOGIC ---
+  // In rides.service.ts
+
+  // Find the existing updateRideStatus method and replace it with this:
   async updateRideStatus(
     rideId: string,
     driverId: string,
     status: 'ARRIVED' | 'IN_PROGRESS' | 'COMPLETED',
   ) {
+    // 1. (Existing) Optional Distance Check for ARRIVED
     if (status === 'ARRIVED') {
-      // A. Get Ride & Driver Location
       const { data: ride } = await this.supabase
         .from('rides')
         .select('pickup_lat, pickup_lng')
@@ -74,7 +77,6 @@ export class RidesService {
         .from('driver_locations')
         .select('lat, lng')
         .eq('driver_id', driverId)
-        .select()
         .single();
 
       if (ride && driverLoc) {
@@ -84,13 +86,13 @@ export class RidesService {
           ride.pickup_lat,
           ride.pickup_lng,
         );
-
-        // B. If driver is more than 300 meters away, reject it
         console.log(`Driver is ${distance} meters away.`);
       }
     }
+
     console.log(`Driver ${driverId} updating ride ${rideId} to ${status}`);
 
+    // 2. (Existing) Update the Ride Status in DB
     const { data, error } = await this.supabase
       .from('rides')
       .update({
@@ -98,7 +100,7 @@ export class RidesService {
         updated_at: new Date().toISOString(),
       })
       .eq('id', rideId)
-      .eq('driver_id', driverId) // SECURITY: Only the assigned driver can update!
+      .eq('driver_id', driverId) // SECURITY: Only assigned driver can update
       .select()
       .single();
 
@@ -109,7 +111,47 @@ export class RidesService {
       );
     }
 
-    // ✅ NEW LOGIC: Handle Payments based on method
+    // ✅ 3. NEW: Notify the Passenger
+    // We run this asynchronously (don't await) so it doesn't block the driver's UI
+    (async () => {
+      try {
+        // A. Get Passenger Token
+        const { data: passenger } = await this.supabase
+          .from('profiles')
+          .select('push_token')
+          .eq('id', data.passenger_id)
+          .single();
+
+        if (passenger?.push_token) {
+          let title = 'Ride Update';
+          let body = '';
+
+          // B. Set Message based on Status
+          switch (status) {
+            case 'ARRIVED':
+              title = 'Driver Arrived 🚖';
+              body = 'Your driver is waiting at the pickup location.';
+              break;
+            case 'IN_PROGRESS':
+              title = 'Ride Started 🚀';
+              body = 'You are on your way to the destination!';
+              break;
+            case 'COMPLETED':
+              title = 'Ride Completed ✅';
+              body = 'You have arrived. Thank you for riding with us!';
+              break;
+          }
+
+          // C. Send Notification
+          await this.sendPushNotification(passenger.push_token, title, body);
+          this.logger.log(`🔔 Sent ${status} notification to passenger.`);
+        }
+      } catch (err) {
+        this.logger.error('Failed to notify passenger of status change', err);
+      }
+    })();
+
+    // 4. (Existing) Handle Payments logic
     if (status === 'COMPLETED') {
       if (data.payment_method === 'WALLET') {
         await this.processWalletPayment(
