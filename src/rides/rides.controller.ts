@@ -6,7 +6,6 @@ export class RidesController {
   constructor(private readonly ridesService: RidesService) {}
 
   @Post('request')
-  
   requestRide(@Body() body: any) {
     if (!body || !body.pickup || !body.dropoff) {
       throw new BadRequestException('Invalid request body');
@@ -88,5 +87,17 @@ export class RidesController {
   async goOffline(@Body() body: any) {
     // Use Supabase directly here or add a service method
     return this.ridesService.removeDriverLocation(body.driverId);
+  }
+  @Post('cancel/passenger')
+  async cancelByPassenger(@Body() body: any) {
+    if (!body.rideId || !body.passengerId) {
+      throw new BadRequestException('Ride ID and Passenger ID are required');
+    }
+
+    return this.ridesService.cancelRideByPassenger(
+      body.rideId,
+      body.passengerId,
+      body.reason || 'USER_CANCELLED',
+    );
   }
 }
