@@ -67,26 +67,44 @@ export class RidesService {
     status: 'ARRIVED' | 'IN_PROGRESS' | 'COMPLETED',
   ) {
     // 1. (Existing) Optional Distance Check for ARRIVED
+    // 1. ENFORCED Distance Check for ARRIVED
     if (status === 'ARRIVED') {
+      const MAX_DISTANCE_METERS = 300; // Configurable threshold
+
+      // Fetch Ride Pickup Coordinates
       const { data: ride } = await this.supabase
         .from('rides')
         .select('pickup_lat, pickup_lng')
         .eq('id', rideId)
         .single();
+
+      // Fetch Driver Current Coordinates
       const { data: driverLoc } = await this.supabase
         .from('driver_locations')
         .select('lat, lng')
         .eq('driver_id', driverId)
         .single();
 
-      if (ride && driverLoc) {
-        const distance = this.getDistanceFromLatLonInKm(
-          driverLoc.lat,
-          driverLoc.lng,
-          ride.pickup_lat,
-          ride.pickup_lng,
+      if (!ride || !driverLoc) {
+        // If we can't verify location, we should probably block the action for safety
+        throw new BadRequestException('Could not verify driver location.');
+      }
+
+      const distance = this.getDistanceFromLatLonInKm(
+        driverLoc.lat,
+        driverLoc.lng,
+        ride.pickup_lat,
+        ride.pickup_lng,
+      ); // Note: Your helper returns meters
+
+      this.logger.log(
+        `Distance Check: ${distance.toFixed(0)}m (Max: ${MAX_DISTANCE_METERS}m)`,
+      );
+
+      if (distance > MAX_DISTANCE_METERS) {
+        throw new BadRequestException(
+          `You are too far from pickup (${Math.floor(distance)}m). Please get closer.`,
         );
-        console.log(`Driver is ${distance} meters away.`);
       }
     }
 
@@ -178,19 +196,25 @@ export class RidesService {
   ) {
     this.logger.log(`💰 Processing Wallet Payment: ${fare} DZD`);
 
-    // 1. Deduct FULL FARE from Passenger
+    let finalPaymentStatus = 'PAID';
+
+    // 1. Attempt to Deduct from Passenger
     const { error: pError } = await this.supabase.rpc('decrement_balance', {
       user_id: passengerId,
       amount: fare,
     });
 
     if (pError) {
-      this.logger.error('Failed to deduct from passenger', pError);
-      // TODO: Handle failure (e.g., mark ride as "PAYMENT_FAILED")
-      return;
+      this.logger.error(
+        `🚨 Wallet Drainage Detected! Passenger ${passengerId} could not pay.`,
+        pError,
+      );
+      // FIX: Do NOT return. Mark as FAILED so we know they owe money.
+      finalPaymentStatus = 'PAYMENT_FAILED';
     }
 
     // 2. Calculate Driver Earnings (Fare - 12%)
+    // NOTE: We pay the driver even if passenger failed (Platform covers it)
     const commission = fare * 0.12;
     const driverEarnings = fare - commission;
 
@@ -202,21 +226,27 @@ export class RidesService {
 
     if (dError) {
       this.logger.error('Failed to pay driver', dError);
+    } else {
+      // Only record the commission transaction if the driver was actually paid
+      await this.supabase.from('transactions').insert({
+        driver_id: driverId,
+        amount: -commission,
+        description: 'Ride Commission (12%) - Wallet Ride',
+        ride_id: rideId,
+      });
     }
 
-    // 4. Record the Commission Transaction
-    await this.supabase.from('transactions').insert({
-      driver_id: driverId,
-      amount: -commission,
-      description: 'Ride Commission (12%) - Wallet Ride',
-      ride_id: rideId,
-    });
-
-    // 5. Mark Ride as Paid
+    // 4. Update Ride Status
+    // We save 'PAYMENT_FAILED' if the deduction failed.
+    // This creates a record of the debt.
     await this.supabase
       .from('rides')
-      .update({ payment_status: 'PAID' })
+      .update({ payment_status: finalPaymentStatus })
       .eq('id', rideId);
+
+    this.logger.log(
+      `Payment processing complete. Status: ${finalPaymentStatus}`,
+    );
   }
 
   private async processCashCommission(
@@ -227,31 +257,65 @@ export class RidesService {
     this.logger.log(`💵 Processing Cash Commission for: ${fare} DZD`);
 
     const commission = fare * 0.12;
+    let paymentStatus = 'PAID'; // Default to success
 
-    // 1. Deduct Commission from Driver's Balance
-    // (We use 'decrement_balance' because they owe us this money)
-    const { error } = await this.supabase.rpc('decrement_balance', {
-      user_id: driverId,
-      amount: commission,
-    });
+    // 1. Attempt to Deduct Commission from Driver
+    // We expect the RPC to return an error if balance is insufficient
+    const { error: deductError } = await this.supabase.rpc(
+      'decrement_balance',
+      {
+        user_id: driverId,
+        amount: commission,
+      },
+    );
 
-    if (error) {
-      this.logger.error('Failed to deduct commission from driver', error);
+    if (deductError) {
+      this.logger.error(
+        `❌ Failed to collect commission from Driver ${driverId}`,
+        deductError,
+      );
+
+      // FIX: Do NOT proceed as normal. Mark this debt!
+      // This prevents the "Free Pass" where drivers keep 100% because the deduction failed.
+      paymentStatus = 'COMMISSION_OWED';
+
+      // Optional: You might want to block the driver here or send a warning
+    } else {
+      // 2. ONLY Record Transaction if Deduction Succeeded
+      // This prevents "Ghost Deductions" (Receipt exists, but money wasn't taken)
+      const { error: txnError } = await this.supabase
+        .from('transactions')
+        .insert({
+          driver_id: driverId,
+          amount: -commission,
+          description: 'Ride Commission (12%) - Cash Ride',
+          ride_id: rideId, // Linked for disputes
+          status: 'COMPLETED',
+        });
+
+      if (txnError) {
+        // Critical Edge Case: Money was taken, but receipt failed.
+        // Log this with HIGH priority for support to see.
+        this.logger.error(
+          `🚨 MONEY LOST? Deduction success but txn failed for Ride ${rideId}`,
+          txnError,
+        );
+      }
     }
 
-    // 2. Record Transaction
-    await this.supabase.from('transactions').insert({
-      driver_id: driverId,
-      amount: -commission,
-      description: 'Ride Commission (12%) - Cash Ride',
-      ride_id: rideId,
-    });
-
-    // 3. Mark Ride as Paid (Driver collected cash)
-    await this.supabase
+    // 3. Update the Ride Status
+    // We save the status as 'PAID' (all good) or 'COMMISSION_OWED' (debt)
+    const { error: updateError } = await this.supabase
       .from('rides')
-      .update({ payment_status: 'PAID' })
+      .update({
+        payment_status: paymentStatus,
+        updated_at: new Date().toISOString(),
+      })
       .eq('id', rideId);
+
+    if (updateError) {
+      this.logger.error('Failed to update ride payment status', updateError);
+    }
   }
 
   // --- OTHER SERVICE METHODS ---
@@ -335,6 +399,19 @@ export class RidesService {
           dropoff_lat: dropoff.lat,
           dropoff_lng: dropoff.lng,
         });
+
+      // 0. BLOCK DEBTORS: Check for outstanding failed payments
+      const { data: debtRides } = await this.supabase
+        .from('rides')
+        .select('id')
+        .eq('passenger_id', passengerId)
+        .eq('payment_status', 'PAYMENT_FAILED');
+
+      if (debtRides && debtRides.length > 0) {
+        throw new BadRequestException(
+          'You have an outstanding payment from a previous ride. Please settle your balance.',
+        );
+      }
 
       if (fareError || !floorPrice) {
         console.error('Fare Calculation Failed:', fareError);
@@ -641,6 +718,93 @@ export class RidesService {
       }
     } catch (err) {
       this.logger.error('Cron job failed:', err);
+    }
+  }
+
+  // --- CRON JOB: Fixes "Driver Hoarding" ---
+  @Cron(CronExpression.EVERY_MINUTE)
+  async handleStuckAcceptedRides() {
+    this.logger.log(
+      '🕵️ Cron Job: Checking for hoarded/stuck ACCEPTED rides...',
+    );
+
+    // TIMEOUT CONFIG: 20 Minutes
+    // If status is still just 'ACCEPTED' after 20 mins, the driver is likely not coming.
+    const timeoutThreshold = new Date(
+      Date.now() - 20 * 60 * 1000,
+    ).toISOString();
+
+    try {
+      // 1. Find rides stuck in 'ACCEPTED' state
+      const { data: stuckRides, error } = await this.supabase
+        .from('rides')
+        .select('id, passenger_id, driver_id')
+        .eq('status', 'ACCEPTED')
+        .lt('updated_at', timeoutThreshold);
+
+      if (error) {
+        this.logger.error('Error fetching stuck accepted rides', error);
+        return;
+      }
+
+      if (!stuckRides || stuckRides.length === 0) return;
+
+      this.logger.warn(
+        `⚠️ Found ${stuckRides.length} hoarded rides. Releasing drivers...`,
+      );
+
+      for (const ride of stuckRides) {
+        // 2. The "Kick" Logic: Unassign driver and return to pool
+        // We set it back to PENDING so the 'handleDispatchWaves' can find a NEW driver.
+        const { error: updateError } = await this.supabase
+          .from('rides')
+          .update({
+            status: 'PENDING', // Back to pool
+            driver_id: null, // Remove the hoarder
+            dispatch_batch: 1, // Reset search radius
+            updated_at: new Date().toISOString(),
+            last_offer_sent_at: new Date().toISOString(), // Reset timer so dispatcher picks it up
+            note: 'Previous driver unresponsive. Auto-reassigned.',
+          })
+          .eq('id', ride.id);
+
+        if (updateError) {
+          this.logger.error(`Failed to unassign ride ${ride.id}`, updateError);
+          continue;
+        }
+
+        // 3. Notify the Passenger
+        const { data: passenger } = await this.supabase
+          .from('profiles')
+          .select('push_token')
+          .eq('id', ride.passenger_id)
+          .single();
+
+        if (passenger?.push_token) {
+          await this.sendPushNotification(
+            passenger.push_token,
+            'Driver Unresponsive 🐢',
+            "We detected your driver wasn't moving. We are finding you a new one!",
+          );
+        }
+
+        // 4. Notify the Kicked Driver (Optional)
+        const { data: driver } = await this.supabase
+          .from('profiles')
+          .select('push_token')
+          .eq('id', ride.driver_id)
+          .single();
+
+        if (driver?.push_token) {
+          await this.sendPushNotification(
+            driver.push_token,
+            'Ride Unassigned 🚫',
+            'You were unassigned due to inactivity.',
+          );
+        }
+      }
+    } catch (err) {
+      this.handleError(err, 'handleStuckAcceptedRides');
     }
   }
 
