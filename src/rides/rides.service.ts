@@ -560,7 +560,12 @@ export class RidesService {
       // 2. Validate Status
       // We allow PENDING, SCHEDULED, or NO_DRIVERS_AVAILABLE (for rescue)
       const validStatuses = ['PENDING', 'SCHEDULED', 'NO_DRIVERS_AVAILABLE'];
-      if (!validStatuses.includes(ride.status)) {
+
+      // Allow if status is valid OR if it's already accepted by THIS driver (Idempotency)
+      const isAlreadyMyRide =
+        ride.status === 'ACCEPTED' && ride.driver_id === driverId;
+
+      if (!validStatuses.includes(ride.status) && !isAlreadyMyRide) {
         throw new BadRequestException('Ride is no longer available.');
       }
 
