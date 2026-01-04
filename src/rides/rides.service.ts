@@ -65,11 +65,12 @@ export class RidesService {
     rideId: string,
     driverId: string,
     status: 'ARRIVED' | 'IN_PROGRESS' | 'COMPLETED',
+    lat?: number, // Optional: Client-provided Lat
+    lng?: number, // Optional: Client-provided Lng
   ) {
-    // 1. (Existing) Optional Distance Check for ARRIVED
     // 1. ENFORCED Distance Check for ARRIVED
     if (status === 'ARRIVED') {
-      const MAX_DISTANCE_METERS = 300; // Configurable threshold
+      const MAX_DISTANCE_METERS = 500; // Increased from 300 to 500 for GPS drift safety
 
       // Fetch Ride Pickup Coordinates
       const { data: ride } = await this.supabase
@@ -78,33 +79,45 @@ export class RidesService {
         .eq('id', rideId)
         .single();
 
-      // Fetch Driver Current Coordinates
-      const { data: driverLoc } = await this.supabase
-        .from('driver_locations')
-        .select('lat, lng')
-        .eq('driver_id', driverId)
-        .single();
+      let currentLat = lat;
+      let currentLng = lng;
 
-      if (!ride || !driverLoc) {
-        // If we can't verify location, we should probably block the action for safety
-        throw new BadRequestException('Could not verify driver location.');
+      // If client didn't send coords, fetch from DB (Fallback)
+      if (!currentLat || !currentLng) {
+        const { data: driverLoc } = await this.supabase
+          .from('driver_locations')
+          .select('lat, lng')
+          .eq('driver_id', driverId)
+          .single();
+
+        if (driverLoc) {
+          currentLat = driverLoc.lat;
+          currentLng = driverLoc.lng;
+        }
       }
 
-      const distance = this.getDistanceFromLatLonInKm(
-        driverLoc.lat,
-        driverLoc.lng,
-        ride.pickup_lat,
-        ride.pickup_lng,
-      ); // Note: Your helper returns meters
-
-      this.logger.log(
-        `Distance Check: ${distance.toFixed(0)}m (Max: ${MAX_DISTANCE_METERS}m)`,
-      );
-
-      if (distance > MAX_DISTANCE_METERS) {
-        throw new BadRequestException(
-          `You are too far from pickup (${Math.floor(distance)}m). Please get closer.`,
+      if (!ride || !currentLat || !currentLng) {
+        // Log warning but allow it to proceed if location is missing (prevents getting stuck)
+        this.logger.warn(
+          `⚠️ skipping distance check for Ride ${rideId} (Location missing)`,
         );
+      } else {
+        const distance = this.getDistanceFromLatLonInKm(
+          currentLat,
+          currentLng,
+          ride.pickup_lat,
+          ride.pickup_lng,
+        );
+
+        this.logger.log(
+          `Distance Check: ${distance.toFixed(0)}m (Max: ${MAX_DISTANCE_METERS}m)`,
+        );
+
+        if (distance > MAX_DISTANCE_METERS) {
+          throw new BadRequestException(
+            `GPS says you are ${Math.floor(distance)}m away. Please move closer to pickup.`,
+          );
+        }
       }
     }
 
@@ -118,7 +131,7 @@ export class RidesService {
         updated_at: new Date().toISOString(),
       })
       .eq('id', rideId)
-      .eq('driver_id', driverId) // SECURITY: Only assigned driver can update
+      .eq('driver_id', driverId)
       .select()
       .single();
 
@@ -129,11 +142,8 @@ export class RidesService {
       );
     }
 
-    // ✅ 3. NEW: Notify the Passenger
-    // We run this asynchronously (don't await) so it doesn't block the driver's UI
     (async () => {
       try {
-        // A. Get Passenger Token
         const { data: passenger } = await this.supabase
           .from('profiles')
           .select('push_token')
@@ -144,7 +154,6 @@ export class RidesService {
           let title = 'Ride Update';
           let body = '';
 
-          // B. Set Message based on Status
           switch (status) {
             case 'ARRIVED':
               title = 'Driver Arrived 🚖';
@@ -159,13 +168,10 @@ export class RidesService {
               body = 'You have arrived. Thank you for riding with us!';
               break;
           }
-
-          // C. Send Notification
           await this.sendPushNotification(passenger.push_token, title, body);
-          this.logger.log(`🔔 Sent ${status} notification to passenger.`);
         }
       } catch (err) {
-        this.logger.error('Failed to notify passenger of status change', err);
+        this.logger.error('Failed to notify passenger', err);
       }
     })();
 

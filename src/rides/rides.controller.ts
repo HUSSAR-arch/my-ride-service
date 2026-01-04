@@ -56,15 +56,16 @@ export class RidesController {
   }
   // Add inside RidesController class
 
-  @Post('arrived')
+@Post('arrived')
   driverArrived(@Body() body: any) {
     return this.ridesService.updateRideStatus(
       body.rideId,
       body.driverId,
       'ARRIVED',
+      body.lat, // Pass Client Latitude
+      body.lng  // Pass Client Longitude
     );
   }
-
   @Post('start')
   startTrip(@Body() body: any) {
     return this.ridesService.updateRideStatus(
