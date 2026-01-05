@@ -9,12 +9,15 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { latLngToCell, gridDisk } from 'h3-js';
 import { Cron, CronExpression } from '@nestjs/schedule';
 
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import { RideRequestedEvent } from './events/ride.events';
+
 @Injectable()
 export class RidesService {
   private supabase: SupabaseClient;
   private readonly logger = new Logger(RidesService.name);
 
-  constructor() {
+  constructor(private eventEmitter: EventEmitter2) {
     this.supabase = createClient(
       process.env.SUPABASE_URL!,
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
@@ -497,44 +500,16 @@ export class RidesService {
         .select()
         .single();
 
-      if (insertError) throw insertError;
-
-      // 7. Trigger the Matcher
       if (!scheduledTime) {
-        this.logger.log(
-          `⚡ Triggering immediate matcher for Ride ${rideData.id}`,
-        );
-
-        // 1. Run the Database Matcher
-        const { data: offeredDriverIds, error: rpcError } =
-          await this.supabase.rpc('find_and_offer_ride', {
-            target_ride_id: rideData.id,
-          });
-
-        if (rpcError) {
-          this.logger.error('❌ Matcher RPC failed:', rpcError);
-        } else {
-          this.logger.log(
-            `🔍 Matcher found ${offeredDriverIds?.length || 0} drivers.`,
-          );
-
-          // 2. Send Push Notification IMMEDIATELY
-          if (offeredDriverIds && offeredDriverIds.length > 0) {
-            // ✅ Pass the fare (3rd argument) so the driver sees "Earn X DZD"
-            this.sendDriverPush(
-              offeredDriverIds,
-              rideData.id,
-              rideData.fare_estimate,
-            ).catch((e) =>
-              this.logger.error('Failed to send immediate push', e),
-            );
-          }
-        }
-      } else {
-        this.logger.log(
-          `📅 Ride ${rideData.id} scheduled for ${scheduledTime}`,
+        this.logger.log(`📢 Emitting event for Ride ${rideData.id}`);
+        // Emit event immediately. The Listener handles the rest.
+        this.eventEmitter.emit(
+          'ride.requested',
+          new RideRequestedEvent(rideData.id, rideData.fare_estimate, 1),
         );
       }
+
+      if (insertError) throw insertError;
 
       return rideData;
     } catch (err) {
@@ -878,7 +853,7 @@ export class RidesService {
 
   // In rides.service.ts
 
-  @Cron('*/10 * * * * *')
+  // @Cron('*/10 * * * * *')
   async handleDispatchWaves() {
     const twentySecondsAgo = new Date(Date.now() - 20 * 1000).toISOString();
 
@@ -1189,5 +1164,59 @@ export class RidesService {
     }
 
     return { success: true };
+  }
+
+  async matchDriversForRide(rideId: string, batch: number) {
+    // 1. Call your existing RPC function here
+    const { data: offeredDriverIds } = await this.supabase.rpc(
+      'find_and_offer_ride',
+      {
+        target_ride_id: rideId,
+      },
+    );
+
+    if (offeredDriverIds?.length > 0) {
+      // 2. Fetch the fare estimate
+      const { data: ride } = await this.supabase
+        .from('rides')
+        .select('fare_estimate')
+        .eq('id', rideId)
+        .single();
+
+      // ✅ FIX: Default to 0 if ride is null to satisfy TypeScript
+      const fare = ride?.fare_estimate ?? 0;
+
+      await this.sendDriverPush(offeredDriverIds, rideId, fare);
+    }
+  }
+
+  async isRideStillPending(rideId: string): Promise<boolean> {
+    const { data } = await this.supabase
+      .from('rides')
+      .select('status')
+      .eq('id', rideId)
+      .single();
+    return data?.status === 'PENDING';
+  }
+
+  async incrementRideBatch(rideId: string) {
+    const { data } = await this.supabase
+      .from('rides')
+      .select('*')
+      .eq('id', rideId)
+      .single();
+    const nextBatch = data.dispatch_batch + 1;
+
+    const { data: updated } = await this.supabase
+      .from('rides')
+      .update({
+        dispatch_batch: nextBatch,
+        last_offer_sent_at: new Date().toISOString(),
+      })
+      .eq('id', rideId)
+      .select()
+      .single();
+
+    return updated;
   }
 }
