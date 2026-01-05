@@ -5,7 +5,6 @@ import { AppController } from './app.controller';
 import { ScheduleModule } from '@nestjs/schedule';
 import { AppService } from './app.service';
 import { RidesModule } from './rides/rides.module';
-import { RidesListener } from './rides/listeners/rides.listener';
 
 @Module({
   imports: [
@@ -19,6 +18,6 @@ import { RidesListener } from './rides/listeners/rides.listener';
     RidesModule,
   ],
   controllers: [AppController],
-  providers: [AppService, RidesListener],
+  providers: [AppService],
 })
 export class AppModule {}
