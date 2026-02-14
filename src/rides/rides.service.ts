@@ -1274,8 +1274,11 @@ export class RidesService {
     if (!ride) throw new BadRequestException('Ride not found');
 
     // 2. Validate OTP (Server-Side)
-    if (ride.start_code !== otp) {
-      throw new BadRequestException('Invalid OTP code');
+    // We convert both to strings and trim whitespace to be safe
+    if (String(ride.start_code).trim() !== String(otp).trim()) {
+      throw new BadRequestException(
+        'Invalid OTP code. Ask passenger for the code.',
+      );
     }
 
     // 3. Proceed to update status
