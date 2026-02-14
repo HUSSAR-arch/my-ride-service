@@ -99,13 +99,10 @@ export class RidesController {
   // REPLACE your existing 'start' endpoint with this secure version
   @Post('start')
   startTrip(@Body() body: any) {
-    // Require OTP for verification
-    if (!body.otp) throw new BadRequestException('OTP is required');
-
-    return this.ridesService.startRideSecurely(
+    return this.ridesService.updateRideStatus(
       body.rideId,
       body.driverId,
-      body.otp,
+      'IN_PROGRESS',
     );
   }
 }
