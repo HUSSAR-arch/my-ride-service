@@ -56,22 +56,14 @@ export class RidesController {
   }
   // Add inside RidesController class
 
-@Post('arrived')
+  @Post('arrived')
   driverArrived(@Body() body: any) {
     return this.ridesService.updateRideStatus(
       body.rideId,
       body.driverId,
       'ARRIVED',
       body.lat, // Pass Client Latitude
-      body.lng  // Pass Client Longitude
-    );
-  }
-  @Post('start')
-  startTrip(@Body() body: any) {
-    return this.ridesService.updateRideStatus(
-      body.rideId,
-      body.driverId,
-      'IN_PROGRESS',
+      body.lng, // Pass Client Longitude
     );
   }
 
@@ -99,6 +91,21 @@ export class RidesController {
       body.rideId,
       body.passengerId,
       body.reason || 'USER_CANCELLED',
+    );
+  }
+
+  // rides.controller.ts
+
+  // REPLACE your existing 'start' endpoint with this secure version
+  @Post('start')
+  startTrip(@Body() body: any) {
+    // Require OTP for verification
+    if (!body.otp) throw new BadRequestException('OTP is required');
+
+    return this.ridesService.startRideSecurely(
+      body.rideId,
+      body.driverId,
+      body.otp,
     );
   }
 }

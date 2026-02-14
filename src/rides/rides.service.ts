@@ -71,40 +71,39 @@ export class RidesService {
     lat?: number, // Optional: Client-provided Lat
     lng?: number, // Optional: Client-provided Lng
   ) {
-    // 1. ENFORCED Distance Check for ARRIVED
-    if (status === 'ARRIVED') {
-      const MAX_DISTANCE_METERS = 500; // Increased from 300 to 500 for GPS drift safety
+    // ---------------------------------------------------------
+    // 1. RESOLVE DRIVER LOCATION (Needed for security checks)
+    // ---------------------------------------------------------
+    let currentLat = lat;
+    let currentLng = lng;
 
-      // Fetch Ride Pickup Coordinates
+    // If client didn't send GPS, fetch last known location from DB
+    if (!currentLat || !currentLng) {
+      const { data: driverLoc } = await this.supabase
+        .from('driver_locations')
+        .select('lat, lng')
+        .eq('driver_id', driverId)
+        .single();
+
+      if (driverLoc) {
+        currentLat = driverLoc.lat;
+        currentLng = driverLoc.lng;
+      }
+    }
+
+    // ---------------------------------------------------------
+    // 2. SECURITY CHECK: ARRIVED (Pickup Location)
+    // ---------------------------------------------------------
+    if (status === 'ARRIVED') {
+      const MAX_PICKUP_DISTANCE = 500; // 500 meters tolerance
+
       const { data: ride } = await this.supabase
         .from('rides')
         .select('pickup_lat, pickup_lng')
         .eq('id', rideId)
         .single();
 
-      let currentLat = lat;
-      let currentLng = lng;
-
-      // If client didn't send coords, fetch from DB (Fallback)
-      if (!currentLat || !currentLng) {
-        const { data: driverLoc } = await this.supabase
-          .from('driver_locations')
-          .select('lat, lng')
-          .eq('driver_id', driverId)
-          .single();
-
-        if (driverLoc) {
-          currentLat = driverLoc.lat;
-          currentLng = driverLoc.lng;
-        }
-      }
-
-      if (!ride || !currentLat || !currentLng) {
-        // Log warning but allow it to proceed if location is missing (prevents getting stuck)
-        this.logger.warn(
-          `⚠️ skipping distance check for Ride ${rideId} (Location missing)`,
-        );
-      } else {
+      if (ride && currentLat && currentLng) {
         const distance = this.getDistanceFromLatLonInKm(
           currentLat,
           currentLng,
@@ -112,21 +111,60 @@ export class RidesService {
           ride.pickup_lng,
         );
 
-        this.logger.log(
-          `Distance Check: ${distance.toFixed(0)}m (Max: ${MAX_DISTANCE_METERS}m)`,
-        );
+        this.logger.log(`📍 Pickup Dist: ${distance.toFixed(0)}m`);
 
-        if (distance > MAX_DISTANCE_METERS) {
+        if (distance > MAX_PICKUP_DISTANCE) {
           throw new BadRequestException(
-            `GPS says you are ${Math.floor(distance)}m away. Please move closer to pickup.`,
+            `You are too far from pickup (${Math.floor(distance)}m). Please move closer.`,
           );
         }
       }
     }
 
+    // ---------------------------------------------------------
+    // 3. SECURITY CHECK: COMPLETED (Dropoff Location) <--- ✅ NEW FIX
+    // ---------------------------------------------------------
+    if (status === 'COMPLETED') {
+      const MAX_DROPOFF_DISTANCE = 1000; // 1km tolerance (allows for parking issues)
+
+      const { data: ride } = await this.supabase
+        .from('rides')
+        .select('dropoff_lat, dropoff_lng')
+        .eq('id', rideId)
+        .single();
+
+      if (ride && currentLat && currentLng) {
+        const distance = this.getDistanceFromLatLonInKm(
+          currentLat,
+          currentLng,
+          ride.dropoff_lat,
+          ride.dropoff_lng,
+        );
+
+        this.logger.log(`🏁 Dropoff Dist: ${distance.toFixed(0)}m`);
+
+        if (distance > MAX_DROPOFF_DISTANCE) {
+          throw new BadRequestException(
+            `You are too far from the destination (${Math.floor(distance)}m). Cannot complete ride yet.`,
+          );
+        }
+      } else {
+        // Optional: If we can't get location, do we block?
+        // For safety, we usually log a warning but let it proceed if GPS is broken,
+        // or block strict. Here I will block strict for safety.
+        if (!currentLat || !currentLng) {
+          throw new BadRequestException(
+            'GPS location required to complete ride.',
+          );
+        }
+      }
+    }
+
+    // ---------------------------------------------------------
+    // 4. UPDATE DATABASE STATUS
+    // ---------------------------------------------------------
     console.log(`Driver ${driverId} updating ride ${rideId} to ${status}`);
 
-    // 2. (Existing) Update the Ride Status in DB
     const { data, error } = await this.supabase
       .from('rides')
       .update({
@@ -145,6 +183,9 @@ export class RidesService {
       );
     }
 
+    // ---------------------------------------------------------
+    // 5. NOTIFICATIONS & PAYMENTS
+    // ---------------------------------------------------------
     (async () => {
       try {
         const { data: passenger } = await this.supabase
@@ -178,7 +219,7 @@ export class RidesService {
       }
     })();
 
-    // 4. (Existing) Handle Payments logic
+    // Handle Payments Logic
     if (status === 'COMPLETED') {
       if (data.payment_method === 'WALLET') {
         await this.processWalletPayment(
@@ -1218,5 +1259,26 @@ export class RidesService {
       .single();
 
     return updated;
+  }
+  // rides.service.ts
+
+  async startRideSecurely(rideId: string, driverId: string, otp: string) {
+    // 1. Fetch the Ride & The Secret Code
+    const { data: ride } = await this.supabase
+      .from('rides')
+      .select('status, start_code, passenger_id') // Ensure you select start_code here
+      .eq('id', rideId)
+      .eq('driver_id', driverId)
+      .single();
+
+    if (!ride) throw new BadRequestException('Ride not found');
+
+    // 2. Validate OTP (Server-Side)
+    if (ride.start_code !== otp) {
+      throw new BadRequestException('Invalid OTP code');
+    }
+
+    // 3. Proceed to update status
+    return this.updateRideStatus(rideId, driverId, 'IN_PROGRESS');
   }
 }
